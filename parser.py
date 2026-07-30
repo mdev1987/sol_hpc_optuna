@@ -645,6 +645,11 @@ class ReplayParquetWriter:
         self.output = output
         self.compression = compression
 
+    @staticmethod
+    def _primitive_columns(frame) -> list[str]:
+        import polars as pl
+        return [c for c, t in zip(frame.columns, frame.dtypes, strict=False) if t not in (pl.Object, pl.Struct)]
+
     def write(
         self,
         dataset,
@@ -658,6 +663,10 @@ class ReplayParquetWriter:
         writer = None
         try:
             for frame in dataframe_stream(dataset, batch_size):
+                cols = self._primitive_columns(frame)
+                if not cols:
+                    continue
+                frame = frame.select(cols)
                 table = frame.to_arrow()
                 if writer is None:
                     writer = pq.ParquetWriter(
