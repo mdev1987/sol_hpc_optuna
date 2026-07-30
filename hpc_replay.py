@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -15,8 +16,6 @@ from constants import (
     CPU_WORKERS,
     DOWNLOAD_DIR,
     DOWNLOAD_WORKERS,
-    LOG_DIR,
-    MODEL_DIR,
     PARQUET_DIR,
     REPORT_DIR,
     OPTUNA_DB,
@@ -29,12 +28,23 @@ app = typer.Typer(add_completion=False)
 console = Console()
 
 
+def _rm(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+    log.info(f"Cleaned {path}")
+
+
 @app.command()
 def run(
-    days: int = CONFIG.days,
-    trials: int = CONFIG.trials,
+    days: int = 3,
+    trials: int = 2000,
     workers: int = CPU_WORKERS,
     download_workers: int = DOWNLOAD_WORKERS,
+    clean: bool = True,
     resume: bool = False,
     skip_download: bool = False,
     skip_parse: bool = False,
@@ -46,10 +56,11 @@ def run(
     """Run the full HPC replay analysis pipeline."""
     init_directories()
 
-    print(f"[bold cyan]Replay Optuna Pipeline[/]")
+    print("[bold cyan]Replay Optuna Pipeline[/]")
     print(f"  Days      : {days}")
     print(f"  Trials    : {trials}")
     print(f"  Workers   : {workers}")
+    print(f"  Auto-clean: {clean}")
     print(f"  Storage   : sqlite:///{OPTUNA_DB}")
     print(f"  Resume    : {resume}")
     print()
@@ -65,6 +76,8 @@ def run(
         log.info("Stage 2/6: Parsing replay to Parquet...")
         _parse_replay()
         log.info("Parsing complete.")
+        if clean:
+            _rm(DOWNLOAD_DIR)
     else:
         log.info("Skipping parse.")
 
@@ -72,6 +85,8 @@ def run(
         log.info("Stage 3/6: Building features...")
         _build_features()
         log.info("Features complete.")
+        if clean:
+            _rm(PARQUET_DIR)
     else:
         log.info("Skipping feature building.")
 
@@ -86,6 +101,8 @@ def run(
         log.info("Stage 5/6: Selecting features...")
         _select_features()
         log.info("Selection complete.")
+        if clean:
+            _rm(CACHE_DIR / "training_dataset.parquet")
     else:
         log.info("Skipping feature selection.")
 
@@ -144,25 +161,29 @@ def _build_dataset() -> None:
     feature_cols = [c for c in df.columns if c not in ignore]
     snapshots = []
     for row in df.iter_rows(named=True):
-        snapshots.append(FeatureSnapshot(
-            mint=row["mint"],
-            timestamp=row["timestamp"],
-            slot=row["slot"],
-            features={c: row[c] for c in feature_cols},
-        ))
+        snapshots.append(
+            FeatureSnapshot(
+                mint=row["mint"],
+                timestamp=row["timestamp"],
+                slot=row["slot"],
+                features={c: row[c] for c in feature_cols},
+            )
+        )
 
-    strategy = WeightedStrategy(StrategyConfig(
-        min_price_change_5=-0.30,
-        min_liquidity=1_000,
-        max_liquidity=5_000_000,
-        min_market_cap=5_000,
-        max_market_cap=10_000_000,
-        min_volume=100,
-        min_buy_ratio=0.10,
-        min_trades=1,
-        min_wallets=1,
-        minimum_score=0.0,
-    ))
+    strategy = WeightedStrategy(
+        StrategyConfig(
+            min_price_change_5=-0.30,
+            min_liquidity=1_000,
+            max_liquidity=5_000_000,
+            min_market_cap=5_000,
+            max_market_cap=10_000_000,
+            min_volume=100,
+            min_buy_ratio=0.10,
+            min_trades=1,
+            min_wallets=1,
+            minimum_score=0.0,
+        )
+    )
 
     builder = DatasetBuilder(SimulatorConfig(), strategy)
     dataset = builder.build(snapshots)
@@ -187,13 +208,16 @@ def _select_features() -> None:
         sys.exit(1)
 
     import polars as pl
+
     df = pl.read_parquet(dataset_path)
     dicts = df.to_dicts()
 
     dataset = TrainingDataset()
     for d in dicts:
         features = {k: v for k, v in d.items() if k != "label"}
-        dataset.samples.append(type("Sample", (), {"features": features, "label": d["label"]})())
+        dataset.samples.append(
+            type("Sample", (), {"features": features, "label": d["label"]})()
+        )
 
     selector = FeatureSelector()
     result = selector.select(dataset)
@@ -204,7 +228,10 @@ def _select_features() -> None:
     importance_path = REPORT_DIR / "feature_importance.json"
     importance_path.write_text(
         json.dumps(
-            [{"feature": f.name, "importance": round(f.importance, 6)} for f in result.importance],
+            [
+                {"feature": f.name, "importance": round(f.importance, 6)}
+                for f in result.importance
+            ],
             indent=2,
         )
     )

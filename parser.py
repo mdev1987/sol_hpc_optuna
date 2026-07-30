@@ -583,11 +583,9 @@ class ReplayBatchIterator:
         batch: list[ReplayEvent] = []
 
         for event in self.dataset:
-
             batch.append(event)
 
             if len(batch) >= self.batch_size:
-
                 yield batch
 
                 batch = []
@@ -653,26 +651,22 @@ class ReplayParquetWriter:
         batch_size: int = 100_000,
     ):
 
-        frames = []
+        import pyarrow.parquet as pq
 
-        for frame in dataframe_stream(
-            dataset,
-            batch_size,
-        ):
-            frames.append(frame)
-
-        if not frames:
-            return
-
-        df = pl.concat(
-            frames,
-            rechunk=True,
-        )
-
-        df.write_parquet(
-            self.output,
-            compression=self.compression,
-        )
+        writer = None
+        try:
+            for frame in dataframe_stream(dataset, batch_size):
+                table = frame.to_arrow()
+                if writer is None:
+                    writer = pq.ParquetWriter(
+                        self.output,
+                        table.schema,
+                        compression=self.compression,
+                    )
+                writer.write_table(table)
+        finally:
+            if writer is not None:
+                writer.close()
 
 
 # ------------------------------------------------------------
@@ -709,9 +703,9 @@ def replay_to_parquet(
 # Replay Index
 # ------------------------------------------------------------
 
+
 @dataclass(slots=True)
 class ReplayMetadata:
-
     file: Path
 
     events: int

@@ -39,16 +39,7 @@ class SnapshotDataset:
         self.frame = pl.read_parquet(path)
 
     def snapshots(self):
-        ignore = {
-            "mint", "timestamp", "slot",
-            "future_max_gain", "future_max_loss",
-            "future_best_price", "future_worst_price",
-            "future_best_time", "future_worst_time",
-            "ttl_return", "hit_take_profit", "hit_stop_loss",
-        }
-        future_columns = {c for c in self.frame.columns if c.startswith("future_return_")}
-        ignore.update(future_columns)
-
+        ignore = {"mint", "timestamp", "slot"}
         feature_columns = [c for c in self.frame.columns if c not in ignore]
 
         for row in self.frame.iter_rows(named=True):

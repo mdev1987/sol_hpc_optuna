@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -86,7 +87,6 @@ class BalancedDatasetBuilder:
             combined = profitable + unprofitable
             return TrainingDataset(samples=combined)
 
-        import random
         random.shuffle(profitable)
         random.shuffle(unprofitable)
 

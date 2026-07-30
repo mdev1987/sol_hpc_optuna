@@ -325,7 +325,7 @@ class Simulator:
         stats = self.portfolio.stats
         trades = stats.trades
         win_rate = stats.wins / trades if trades else 0.0
-        profit_factor = stats.gross_profit / stats.gross_loss if stats.gross_loss > 0 else float("inf")
+        profit_factor = stats.gross_profit / stats.gross_loss if stats.gross_loss > 0 else 999.0
 
         return SimulationResult(
             final_balance=self.portfolio.balance,

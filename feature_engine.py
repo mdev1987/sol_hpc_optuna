@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque
+from itertools import islice
+from typing import Deque
 
 from parser import ReplayEvent
 
@@ -29,17 +30,21 @@ class PriceState:
             return 0.0
         alpha = 2.0 / (period + 1)
         ema_val = self.history[0]
-        for p in self.history[1:]:
+        for p in islice(self.history, 1, None):
             ema_val = alpha * p + (1 - alpha) * ema_val
         return ema_val
 
+    def _prices(self) -> list[float]:
+        return list(self.history)
+
     def rsi(self, period: int = 14) -> float:
-        if len(self.history) < period + 1:
+        prices = self._prices()
+        if len(prices) < period + 1:
             return 50.0
         gains = 0.0
         losses = 0.0
         for i in range(-period, 0):
-            change = self.history[i] - self.history[i - 1]
+            change = prices[i] - prices[i - 1]
             if change > 0:
                 gains += change
             else:
@@ -302,9 +307,12 @@ class FeatureEngine:
         return {
             "price_velocity": self.velocity(state.price.history, state.time.history),
             "volume_velocity": self.velocity(v.history, state.time.history),
-            "liquidity_velocity": self.velocity(state.liquidity.history, state.time.history),
+            "liquidity_velocity": self.velocity(
+                state.liquidity.history, state.time.history
+            ),
             "trade_velocity": v.trades / max(state.market.age_seconds, 1),
-            "wallet_velocity": len(state.wallets.unique) / max(state.market.age_seconds, 1),
+            "wallet_velocity": len(state.wallets.unique)
+            / max(state.market.age_seconds, 1),
         }
 
     def _merge_features(self, *groups: dict[str, float]) -> dict[str, float]:
@@ -357,22 +365,53 @@ class FeatureEngine:
 
 def feature_names() -> list[str]:
     return [
-        "price", "price_first", "price_high", "price_low",
-        "price_change", "price_change_5", "price_change_20",
-        "price_change_50", "price_change_100",
-        "vwap", "ema5", "ema20", "ema50", "ema100",
-        "rsi", "macd_line", "macd_signal", "macd_hist", "roc_20",
-        "liquidity", "liquidity_first", "liquidity_high", "liquidity_low",
-        "liquidity_change", "liquidity_change_5", "liquidity_change_20",
+        "price",
+        "price_first",
+        "price_high",
+        "price_low",
+        "price_change",
+        "price_change_5",
+        "price_change_20",
+        "price_change_50",
+        "price_change_100",
+        "vwap",
+        "ema5",
+        "ema20",
+        "ema50",
+        "ema100",
+        "rsi",
+        "macd_line",
+        "macd_signal",
+        "macd_hist",
+        "roc_20",
+        "liquidity",
+        "liquidity_first",
+        "liquidity_high",
+        "liquidity_low",
+        "liquidity_change",
+        "liquidity_change_5",
+        "liquidity_change_20",
         "liquidity_change_50",
-        "market_cap", "age_seconds",
-        "trades", "buys", "sells",
-        "volume", "buy_volume", "sell_volume",
-        "buy_ratio", "sell_ratio", "avg_trade",
-        "largest_buy", "largest_sell",
-        "unique_wallets", "wallet_events",
-        "price_velocity", "volume_velocity", "liquidity_velocity",
-        "trade_velocity", "wallet_velocity",
+        "market_cap",
+        "age_seconds",
+        "trades",
+        "buys",
+        "sells",
+        "volume",
+        "buy_volume",
+        "sell_volume",
+        "buy_ratio",
+        "sell_ratio",
+        "avg_trade",
+        "largest_buy",
+        "largest_sell",
+        "unique_wallets",
+        "wallet_events",
+        "price_velocity",
+        "volume_velocity",
+        "liquidity_velocity",
+        "trade_velocity",
+        "wallet_velocity",
     ]
 
 
@@ -390,7 +429,7 @@ def build_features_from_parquet(df, batch_size: int = 100_000):
 
     total_rows = len(df)
     for start in range(0, total_rows, batch_size):
-        batch = df[start: start + batch_size]
+        batch = df[start : start + batch_size]
         for row in batch.iter_rows(named=True):
             event = ReplayEvent(
                 timestamp=row.get("timestamp", 0),
@@ -409,4 +448,5 @@ def build_features_from_parquet(df, batch_size: int = 100_000):
 
     dicts = [dataclasses.asdict(s) for s in snapshots]
     import polars as pl
+
     return pl.from_dicts(dicts)

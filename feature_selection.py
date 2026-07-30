@@ -18,10 +18,11 @@ class SelectionResult:
 
 
 class RandomForestSelector:
-    def __init__(self, n_estimators: int = 100, max_depth: int = 10, min_samples: int = 100):
+    def __init__(self, n_estimators: int = 100, max_depth: int = 10, min_samples: int = 100, cumulative_threshold: float = 0.95):
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.min_samples = min_samples
+        self.cumulative_threshold = cumulative_threshold
 
     def select(self, dataset: TrainingDataset) -> SelectionResult:
         if len(dataset) < self.min_samples:
@@ -56,7 +57,7 @@ class RandomForestSelector:
         for feat in importance:
             cumulative += feat.importance
             selected.append(feat.name)
-            if cumulative >= 0.95:
+            if cumulative >= self.cumulative_threshold:
                 break
 
         if not selected:
@@ -70,6 +71,7 @@ class ThresholdConfig:
     correlation_threshold: float = 0.95
     variance_threshold: float = 0.01
     min_features: int = 5
+    cumulative_importance: float = 0.95
 
 
 class CorrelationFilter:
@@ -129,10 +131,12 @@ class FeatureSelector:
         rf_selector: RandomForestSelector | None = None,
         corr_filter: CorrelationFilter | None = None,
         var_filter: LowVarianceFilter | None = None,
+        threshold_config: ThresholdConfig | None = None,
     ):
-        self.rf_selector = rf_selector or RandomForestSelector()
-        self.corr_filter = corr_filter or CorrelationFilter()
-        self.var_filter = var_filter or LowVarianceFilter()
+        tc = threshold_config or ThresholdConfig()
+        self.rf_selector = rf_selector or RandomForestSelector(cumulative_threshold=tc.cumulative_importance)
+        self.corr_filter = corr_filter or CorrelationFilter(tc)
+        self.var_filter = var_filter or LowVarianceFilter(tc)
 
     def select(self, dataset: TrainingDataset) -> SelectionResult:
         rf_result = self.rf_selector.select(dataset)
