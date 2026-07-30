@@ -5,6 +5,8 @@ from rich import print
 from config import CONFIG
 from logger import log
 from paths import init_directories
+from download import Downloader
+import asyncio
 
 app = typer.Typer(add_completion=False)
 
@@ -28,6 +30,11 @@ def run(
     #
     # Download Replay
     #
+    log.info("Downloading replay...")
+
+    asyncio.run(Downloader().download_week(days))
+
+    log.info("Download complete.")
 
 
 if __name__ == "__main__":
