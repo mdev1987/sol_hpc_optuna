@@ -421,7 +421,7 @@ def build_features(events):
         yield engine.update(event)
 
 
-def build_features_from_parquet(df, batch_size: int = 100_000):
+def build_features_from_parquet(df, batch_size: int = 100_000, progress=None, task_id=None):
     import dataclasses
 
     engine = FeatureEngine()
@@ -445,6 +445,8 @@ def build_features_from_parquet(df, batch_size: int = 100_000):
                 raw=row,
             )
             snapshots.append(engine.update(event))
+        if progress is not None and task_id is not None:
+            progress.update(task_id, advance=len(batch))
 
     dicts = [dataclasses.asdict(s) for s in snapshots]
     import polars as pl

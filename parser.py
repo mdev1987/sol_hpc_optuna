@@ -649,6 +649,8 @@ class ReplayParquetWriter:
         self,
         dataset,
         batch_size: int = 100_000,
+        progress=None,
+        task_id=None,
     ):
 
         import pyarrow.parquet as pq
@@ -664,6 +666,8 @@ class ReplayParquetWriter:
                         compression=self.compression,
                     )
                 writer.write_table(table)
+                if progress is not None and task_id is not None:
+                    progress.update(task_id, advance=len(frame))
         finally:
             if writer is not None:
                 writer.close()
@@ -678,6 +682,8 @@ def replay_to_parquet(
     replay_directory,
     output,
     batch_size: int = 100_000,
+    progress=None,
+    task_id=None,
 ):
 
     dataset = load_replay(replay_directory)
@@ -687,6 +693,8 @@ def replay_to_parquet(
     writer.write(
         dataset,
         batch_size=batch_size,
+        progress=progress,
+        task_id=task_id,
     )
 
 

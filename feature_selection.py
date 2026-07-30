@@ -138,10 +138,13 @@ class FeatureSelector:
         self.corr_filter = corr_filter or CorrelationFilter(tc)
         self.var_filter = var_filter or LowVarianceFilter(tc)
 
-    def select(self, dataset: TrainingDataset) -> SelectionResult:
+    def select(self, dataset: TrainingDataset, progress=None, task_id=None) -> SelectionResult:
         rf_result = self.rf_selector.select(dataset)
         if not rf_result.features:
             return rf_result
+
+        if progress is not None and task_id is not None:
+            progress.update(task_id, description="Filtering correlated features...")
 
         filtered = self.corr_filter.filter(dataset, rf_result.importance)
         filtered = self.var_filter.filter(dataset, filtered)
@@ -150,5 +153,8 @@ class FeatureSelector:
             filtered = rf_result.features[:5]
 
         filtered_importance = [f for f in rf_result.importance if f.name in filtered]
+
+        if progress is not None and task_id is not None:
+            progress.update(task_id, advance=1)
 
         return SelectionResult(features=filtered, importance=filtered_importance)

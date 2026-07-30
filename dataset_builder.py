@@ -33,10 +33,13 @@ class DatasetBuilder:
         self.config = config
         self.strategy = strategy
 
-    def build(self, snapshots: Iterable[FeatureSnapshot]) -> TrainingDataset:
+    def build(self, snapshots: Iterable[FeatureSnapshot], progress=None, task_id=None) -> TrainingDataset:
         dataset = TrainingDataset()
 
         for snapshot in snapshots:
+            if progress is not None and task_id is not None:
+                progress.advance(task_id)
+
             score = self.strategy.score(snapshot)
             if score < self.strategy.config.minimum_score:
                 continue

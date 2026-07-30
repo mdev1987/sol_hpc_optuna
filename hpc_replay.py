@@ -9,6 +9,16 @@ from pathlib import Path
 import typer
 from rich import print
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
 
 from config import CONFIG
 from constants import (
@@ -36,6 +46,26 @@ def _rm(path: Path) -> None:
     else:
         path.unlink()
     log.info(f"Cleaned {path}")
+
+
+def _parquet_progress() -> Progress:
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[cyan]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total} events"),
+        TransferSpeedColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+    )
+
+
+def _indeterminate_progress() -> Progress:
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[cyan]{task.description}"),
+        TimeElapsedColumn(),
+    )
 
 
 @app.command()
@@ -118,10 +148,23 @@ def run(
 
 
 def _parse_replay() -> None:
+    import polars as pl
     from parser import replay_to_parquet
 
     parquet_path = PARQUET_DIR / "replay.parquet"
-    replay_to_parquet(DOWNLOAD_DIR, parquet_path, batch_size=100_000)
+    if parquet_path.exists():
+        log.info("Parquet cache exists, skipping.")
+        return
+
+    total_events = 0
+    for f in sorted(DOWNLOAD_DIR.rglob("*.jsonl.zst")):
+        total_events += 1
+
+    with _parquet_progress() as progress:
+        task = progress.add_task("Parsing", total=total_events)
+        replay_to_parquet(DOWNLOAD_DIR, parquet_path, batch_size=100_000, progress=progress, task_id=task)
+
+    log.info(f"Parquet saved: {parquet_path}")
 
 
 def _build_features() -> None:
@@ -139,7 +182,12 @@ def _build_features() -> None:
         return
 
     df = pl.read_parquet(parquet_path)
-    features_df = build_features_from_parquet(df)
+    total_events = len(df)
+
+    with _parquet_progress() as progress:
+        task = progress.add_task("Features", total=total_events)
+        features_df = build_features_from_parquet(df, progress=progress, task_id=task)
+
     features_df.write_parquet(features_path)
     log.info(f"Features saved: {features_path} ({len(features_df)} rows)")
 
@@ -159,16 +207,20 @@ def _build_dataset() -> None:
     df = pl.read_parquet(features_path)
     ignore = {"mint", "timestamp", "slot"}
     feature_cols = [c for c in df.columns if c not in ignore]
-    snapshots = []
-    for row in df.iter_rows(named=True):
-        snapshots.append(
-            FeatureSnapshot(
-                mint=row["mint"],
-                timestamp=row["timestamp"],
-                slot=row["slot"],
-                features={c: row[c] for c in feature_cols},
+
+    with _parquet_progress() as progress:
+        task = progress.add_task("Loading snapshots", total=len(df))
+        snapshots = []
+        for row in df.iter_rows(named=True):
+            snapshots.append(
+                FeatureSnapshot(
+                    mint=row["mint"],
+                    timestamp=row["timestamp"],
+                    slot=row["slot"],
+                    features={c: row[c] for c in feature_cols},
+                )
             )
-        )
+            progress.advance(task)
 
     strategy = WeightedStrategy(
         StrategyConfig(
@@ -186,7 +238,10 @@ def _build_dataset() -> None:
     )
 
     builder = DatasetBuilder(SimulatorConfig(), strategy)
-    dataset = builder.build(snapshots)
+
+    with _parquet_progress() as progress:
+        task = progress.add_task("Evaluating candidates", total=len(snapshots))
+        dataset = builder.build(snapshots, progress=progress, task_id=task)
 
     dataset_path = CACHE_DIR / "training_dataset.parquet"
     rows = [{**s.features, "label": s.label} for s in dataset.samples]
@@ -199,6 +254,8 @@ def _build_dataset() -> None:
 
 
 def _select_features() -> None:
+    import polars as pl
+
     from dataset_builder import TrainingDataset
     from feature_selection import FeatureSelector
 
@@ -207,20 +264,25 @@ def _select_features() -> None:
         log.error(f"Dataset not found: {dataset_path}")
         sys.exit(1)
 
-    import polars as pl
-
     df = pl.read_parquet(dataset_path)
     dicts = df.to_dicts()
 
-    dataset = TrainingDataset()
-    for d in dicts:
-        features = {k: v for k, v in d.items() if k != "label"}
-        dataset.samples.append(
-            type("Sample", (), {"features": features, "label": d["label"]})()
-        )
+    with _parquet_progress() as progress:
+        task = progress.add_task("Loading dataset", total=len(dicts))
+        dataset = TrainingDataset()
+        for d in dicts:
+            features = {k: v for k, v in d.items() if k != "label"}
+            dataset.samples.append(
+                type("Sample", (), {"features": features, "label": d["label"]})()
+            )
+            progress.advance(task)
 
     selector = FeatureSelector()
-    result = selector.select(dataset)
+
+    with _indeterminate_progress() as progress:
+        task = progress.add_task("Training Random Forest...", total=None)
+        result = selector.select(dataset)
+        progress.update(task, description=f"Selected {len(result.features)} features")
 
     selection_path = CACHE_DIR / "selected_features.json"
     selection_path.write_text(json.dumps(result.features, indent=2))
