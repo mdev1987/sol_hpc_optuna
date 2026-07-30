@@ -20,3 +20,5 @@ TIMEOUT = 30
 RETRIES = 5
 
 USER_AGENT = "ReplayOptuna/1.0"
+
+OPTUNA_DB = ROOT / "optuna.db"
