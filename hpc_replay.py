@@ -147,14 +147,25 @@ def run(
     print("\n[bold green]✓ Pipeline finished successfully[/]")
 
 
+def _valid_parquet(path: Path) -> bool:
+    if not path.exists():
+        return False
+    if path.stat().st_size < 1024:
+        path.unlink()
+        return False
+    return True
+
+
 def _parse_replay() -> None:
     import polars as pl
     from parser import replay_to_parquet
 
     parquet_path = PARQUET_DIR / "replay.parquet"
-    if parquet_path.exists():
+    if _valid_parquet(parquet_path):
         log.info("Parquet cache exists, skipping.")
         return
+    elif parquet_path.exists():
+        log.warning("Corrupt parquet removed, re-parsing.")
 
     total_events = 0
     for f in sorted(DOWNLOAD_DIR.rglob("*.jsonl.zst")):
@@ -177,7 +188,7 @@ def _build_features() -> None:
         sys.exit(1)
 
     features_path = CACHE_DIR / "features.parquet"
-    if features_path.exists():
+    if _valid_parquet(features_path):
         log.info("Features cache exists, skipping.")
         return
 
