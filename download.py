@@ -32,12 +32,10 @@ import httpx
 from rich.progress import (
     Progress,
     BarColumn,
-    DownloadColumn,
     SpinnerColumn,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
-    TransferSpeedColumn,
 )
 
 from constants import (
@@ -290,8 +288,7 @@ class ReplayDownloader:
             SpinnerColumn(),
             TextColumn("[cyan]{task.description}"),
             BarColumn(),
-            DownloadColumn(),
-            TransferSpeedColumn(),
+            TextColumn("{task.completed}/{task.total} files"),
             TimeElapsedColumn(),
             TimeRemainingColumn(),
             transient=False,
