@@ -197,8 +197,14 @@ def _build_features() -> None:
 
     features_path = CACHE_DIR / "features.parquet"
     if _valid_parquet(features_path):
-        log.info("Features cache exists, skipping.")
-        return
+        import pyarrow.parquet as pq
+
+        schema = pq.read_schema(features_path)
+        if "price" in schema.names and "liquidity" in schema.names:
+            log.info("Features cache exists, skipping.")
+            return
+        log.warning("Stale features schema detected, rebuilding.")
+        features_path.unlink()
 
     df = pl.read_parquet(parquet_path)
     total_events = len(df)

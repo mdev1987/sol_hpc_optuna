@@ -453,7 +453,11 @@ def build_features_from_parquet(df, batch_size: int = 100_000, progress=None, ta
             if output is not None and snapshots:
                 import pyarrow.parquet as pq
 
-                dicts = [dataclasses.asdict(s) for s in snapshots]
+                dicts = []
+                for s in snapshots:
+                    row = {"mint": s.mint, "timestamp": s.timestamp, "slot": s.slot}
+                    row.update(s.features)
+                    dicts.append(row)
                 frame = pl.from_dicts(dicts)
                 table = frame.to_arrow()
                 if writer is None:
