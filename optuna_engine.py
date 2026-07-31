@@ -1,13 +1,26 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import optuna
 
 from feature_engine import FeatureSnapshot
 from simulator import Simulator, SimulatorConfig, StrategyConfig, WeightedStrategy
+
+
+def _finite(value: float, fallback: float = 0.0) -> float:
+    if value is None:
+        return fallback
+    try:
+        if not math.isfinite(value):
+            return fallback
+    except TypeError:
+        return fallback
+    return value
 
 
 @dataclass(slots=True)
@@ -42,7 +55,7 @@ class SnapshotDataset:
         self._mints = self.frame["mint"].to_list()
         self._timestamps = self.frame["timestamp"].to_numpy()
         self._slots = self.frame["slot"].to_numpy()
-        self._features = self.frame.select(self.feature_columns).to_numpy()
+        self._features = np.nan_to_num(self.frame.select(self.feature_columns).to_numpy(), nan=0.0, posinf=0.0, neginf=0.0)
 
     def snapshots(self):
         for i in range(len(self._features)):
@@ -105,18 +118,24 @@ class Objective:
         if result.trades < 20:
             return -1e9
 
+        profit_factor = _finite(result.profit_factor)
+        win_rate = _finite(result.win_rate)
+        total_return = _finite(result.total_return)
+        total_pnl = _finite(result.total_pnl)
+        max_drawdown = _finite(result.max_drawdown)
+
         score = (
-            2.5 * result.profit_factor
-            + 1.5 * result.win_rate
-            + 1.0 * result.total_return
-            + 0.5 * result.total_pnl
-            - 3.0 * result.max_drawdown
+            2.5 * profit_factor
+            + 1.5 * win_rate
+            + 1.0 * total_return
+            + 0.5 * total_pnl
+            - 3.0 * max_drawdown
         )
 
-        trial.set_user_attr("profit_factor", result.profit_factor)
-        trial.set_user_attr("win_rate", result.win_rate)
-        trial.set_user_attr("drawdown", result.max_drawdown)
-        trial.set_user_attr("trades", result.trades)
+        trial.set_user_attr("profit_factor", profit_factor)
+        trial.set_user_attr("win_rate", win_rate)
+        trial.set_user_attr("drawdown", max_drawdown)
+        trial.set_user_attr("trades", int(result.trades))
 
         return score
 

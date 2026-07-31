@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterable
@@ -321,24 +322,35 @@ class Simulator:
             return
         self.portfolio.open_position(snapshot)
 
+    @staticmethod
+    def _safe(value: float, fallback: float = 0.0) -> float:
+        try:
+            if not math.isfinite(value):
+                return fallback
+        except (TypeError, ValueError):
+            return fallback
+        return value
+
     def _result(self) -> SimulationResult:
         stats = self.portfolio.stats
         trades = stats.trades
         win_rate = stats.wins / trades if trades else 0.0
         profit_factor = stats.gross_profit / stats.gross_loss if stats.gross_loss > 0 else 999.0
+        balance = self._safe(self.portfolio.balance)
+        total_return = (balance - self.config.initial_balance) / self.config.initial_balance
 
         return SimulationResult(
-            final_balance=self.portfolio.balance,
-            total_return=(self.portfolio.balance - self.config.initial_balance) / self.config.initial_balance,
+            final_balance=balance,
+            total_return=self._safe(total_return),
             trades=trades,
             wins=stats.wins,
             losses=stats.losses,
-            win_rate=win_rate,
-            gross_profit=stats.gross_profit,
-            gross_loss=stats.gross_loss,
-            profit_factor=profit_factor,
-            total_pnl=stats.total_pnl,
-            max_drawdown=stats.max_drawdown,
+            win_rate=self._safe(win_rate),
+            gross_profit=self._safe(stats.gross_profit),
+            gross_loss=self._safe(stats.gross_loss),
+            profit_factor=self._safe(profit_factor, 999.0),
+            total_pnl=self._safe(stats.total_pnl),
+            max_drawdown=self._safe(stats.max_drawdown),
             equity_curve=list(stats.equity_curve),
             closed_trades=list(self.portfolio.closed),
         )

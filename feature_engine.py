@@ -421,6 +421,18 @@ def build_features(events):
         yield engine.update(event)
 
 
+def _safe_float(value) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if result != result:
+        return 0.0
+    if result in (float("inf"), float("-inf")):
+        return 0.0
+    return result
+
+
 def build_features_from_parquet(df, batch_size: int = 100_000, progress=None, task_id=None, output=None) -> int:
     import dataclasses
     import polars as pl
@@ -442,10 +454,10 @@ def build_features_from_parquet(df, batch_size: int = 100_000, progress=None, ta
                     mint=row.get("mint", ""),
                     trader=row.get("trader", ""),
                     side=row.get("side", ""),
-                    amount=float(row.get("amount", 0)),
-                    price=float(row.get("price", 0)),
-                    market_cap=float(row.get("market_cap", 0)),
-                    liquidity=float(row.get("liquidity", 0)),
+                    amount=_safe_float(row.get("amount", 0)),
+                    price=_safe_float(row.get("price", 0)),
+                    market_cap=_safe_float(row.get("market_cap", 0)),
+                    liquidity=_safe_float(row.get("liquidity", 0)),
                     raw=row,
                 )
                 snapshots.append(engine.update(event))
