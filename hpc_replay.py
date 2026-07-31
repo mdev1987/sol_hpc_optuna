@@ -190,41 +190,42 @@ def _parse_one_file(file: Path, output: Path, batch_size: int = 100_000) -> int:
 def _auto_workers(requested: int) -> int:
     """Cap parse workers to fit available RAM (respecting cgroup limits).
 
-    Each worker imports polars/pyarrow and holds batch buffers, so it can
-    use ~1.5-2GB. `free` shows host RAM, but cloud VPSes often enforce a
-    lower cgroup memory cap that the OOM killer enforces on our workers.
+    Each parse worker imports polars/pyarrow and holds 100k-row batches,
+    so it can briefly use ~3GB. `free` shows host RAM, but cloud VPSes
+    may enforce a lower cgroup memory cap that the OOM killer applies to
+    our worker processes.
     """
-    try:
-        import resource
-    except ImportError:
-        return requested
 
-    avail_bytes = None
-    try:
-        with open("/sys/fs/cgroup/memory.max") as f:
-            limit = int(f.read().strip())
-        if limit > 0:
-            avail_bytes = limit
-    except FileNotFoundError:
+    def _read_bytes(path: str) -> int | None:
         try:
-            with open("/sys/fs/cgroup/memory/memory.limit_in_bytes") as f:
-                limit = int(f.read().strip())
-            if limit > 0:
-                avail_bytes = limit
-        except (FileNotFoundError, ValueError):
+            with open(path) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    # cgroup v2 limit (bytes), then v1 limit (bytes).
+    limit = None
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        value = _read_bytes(path)
+        if value is not None and value > 0:
+            limit = value
+            break
+
+    # Fall back to the host's MemAvailable (kB).
+    if limit is None:
+        try:
+            for line in open("/proc/meminfo"):
+                if line.startswith("MemAvailable:"):
+                    limit = int(line.split()[1]) * 1024
+                    break
+        except (OSError, ValueError):
             pass
-    except (ValueError, OSError):
-        pass
 
-    if avail_bytes is None:
-        total = resource.getrlimit(resource.RLIMIT_AS)[1]
-        avail_bytes = total if total not in (resource.RLIM_INFINITY, -1) else None
-
-    if avail_bytes is None:
+    if limit is None:
         return requested
 
-    avail_gb = avail_bytes / (1024**3)
-    workers = min(requested, max(1, int(avail_gb // 2.0)))
+    avail_gb = limit / (1024**3)
+    workers = min(requested, max(1, int(avail_gb // 3.0)))
     if workers < requested:
         log.info(
             f"Capping parse workers {requested} -> {workers} "
@@ -243,6 +244,7 @@ def _parse_replay(workers: int = CPU_WORKERS) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
     from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures.process import BrokenProcessPool
 
     workers = _auto_workers(workers)
 
@@ -281,7 +283,7 @@ def _parse_replay(workers: int = CPU_WORKERS) -> None:
         _run_pool(workers)
     except BrokenProcessPool:
         # A worker was killed (e.g. OOM). Retry once with fewer workers.
-        retry_workers = max(1, workers // 2)
+        retry_workers = _auto_workers(workers) // 2 or 1
         log.warning(
             f"Parse worker pool died (OOM?), retrying with {retry_workers} workers."
         )
