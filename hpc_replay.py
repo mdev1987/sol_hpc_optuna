@@ -187,6 +187,52 @@ def _parse_one_file(file: Path, output: Path, batch_size: int = 100_000) -> int:
     return 1
 
 
+def _auto_workers(requested: int) -> int:
+    """Cap parse workers to fit available RAM (respecting cgroup limits).
+
+    Each worker imports polars/pyarrow and holds batch buffers, so it can
+    use ~1.5-2GB. `free` shows host RAM, but cloud VPSes often enforce a
+    lower cgroup memory cap that the OOM killer enforces on our workers.
+    """
+    try:
+        import resource
+    except ImportError:
+        return requested
+
+    avail_bytes = None
+    try:
+        with open("/sys/fs/cgroup/memory.max") as f:
+            limit = int(f.read().strip())
+        if limit > 0:
+            avail_bytes = limit
+    except FileNotFoundError:
+        try:
+            with open("/sys/fs/cgroup/memory/memory.limit_in_bytes") as f:
+                limit = int(f.read().strip())
+            if limit > 0:
+                avail_bytes = limit
+        except (FileNotFoundError, ValueError):
+            pass
+    except (ValueError, OSError):
+        pass
+
+    if avail_bytes is None:
+        total = resource.getrlimit(resource.RLIMIT_AS)[1]
+        avail_bytes = total if total not in (resource.RLIM_INFINITY, -1) else None
+
+    if avail_bytes is None:
+        return requested
+
+    avail_gb = avail_bytes / (1024**3)
+    workers = min(requested, max(1, int(avail_gb // 2.0)))
+    if workers < requested:
+        log.info(
+            f"Capping parse workers {requested} -> {workers} "
+            f"(~{avail_gb:.1f}GB RAM available)"
+        )
+    return workers
+
+
 def _parse_replay(workers: int = CPU_WORKERS) -> None:
     """Parse all hourly archives in parallel, then merge into one Parquet.
 
@@ -197,6 +243,8 @@ def _parse_replay(workers: int = CPU_WORKERS) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
     from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    workers = _auto_workers(workers)
 
     parquet_path = PARQUET_DIR / "replay.parquet"
     if parquet_path.exists():
@@ -212,21 +260,34 @@ def _parse_replay(workers: int = CPU_WORKERS) -> None:
         shutil.rmtree(parts_dir)
     parts_dir.mkdir(parents=True, exist_ok=True)
 
-    with _parse_progress() as progress:
-        task = progress.add_task("Parsing", total=len(files))
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(_parse_one_file, f, parts_dir / f"{f.stem}.parquet"): f
-                for f in files
-            }
-            for fut in as_completed(futures):
-                file = futures[fut]
-                try:
-                    fut.result()
-                except Exception:
-                    log.error(f"Failed to parse {file.name}")
-                    raise
-                progress.advance(task)
+    def _run_pool(pool_workers: int) -> None:
+        with _parse_progress() as progress:
+            task = progress.add_task("Parsing", total=len(files))
+            with ProcessPoolExecutor(max_workers=pool_workers) as pool:
+                futures = {
+                    pool.submit(_parse_one_file, f, parts_dir / f"{f.stem}.parquet"): f
+                    for f in files
+                }
+                for fut in as_completed(futures):
+                    file = futures[fut]
+                    try:
+                        fut.result()
+                    except Exception:
+                        log.error(f"Failed to parse {file.name}")
+                        raise
+                    progress.advance(task)
+
+    try:
+        _run_pool(workers)
+    except BrokenProcessPool:
+        # A worker was killed (e.g. OOM). Retry once with fewer workers.
+        retry_workers = max(1, workers // 2)
+        log.warning(
+            f"Parse worker pool died (OOM?), retrying with {retry_workers} workers."
+        )
+        shutil.rmtree(parts_dir)
+        parts_dir.mkdir(parents=True, exist_ok=True)
+        _run_pool(retry_workers)
 
     tables = [pq.read_table(p) for p in sorted(parts_dir.glob("*.parquet"))]
     merged = pa.concat_tables(tables)
