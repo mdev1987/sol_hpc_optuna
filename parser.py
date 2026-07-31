@@ -181,29 +181,42 @@ def get_str(
 class EventParser:
     """
     Converts raw JSON dictionaries into ReplayEvent objects.
+
+    Only trade events (action ``buy`` / ``sell``) are parsed; non-trade
+    actions (transfer, create, createPool, claimCreatorFees, ...) yield
+    ``None`` so they are excluded from the replay stream.
     """
+
+    TRADE_ACTIONS = {"buy", "sell"}
 
     @staticmethod
     def parse(
         raw: dict[str, Any],
-    ) -> ReplayEvent:
+    ) -> ReplayEvent | None:
+
+        action = get_str(raw, "action", "").lower()
+
+        if action not in EventParser.TRADE_ACTIONS:
+            return None
 
         return ReplayEvent(
-            timestamp=get_int(raw, "timestamp", "time"),
+            timestamp=get_int(raw, "timestamp", "time") // 1000,
             signature=get_str(raw, "signature"),
-            slot=get_int(raw, "slot"),
+            slot=get_int(raw, "block", "slot"),
             mint=get_str(raw, "mint"),
-            trader=get_str(raw, "trader", "wallet"),
-            side=get_str(raw, "side"),
-            amount=get_float(raw, "amount"),
+            trader=get_str(raw, "txSigner", "trader", "wallet"),
+            side=action,
+            amount=get_float(raw, "quoteAmount", "amount"),
             price=get_float(raw, "price"),
             market_cap=get_float(
                 raw,
+                "marketCapQuote",
                 "market_cap",
                 "marketCap",
             ),
             liquidity=get_float(
                 raw,
+                "quoteInPool",
                 "liquidity",
             ),
             raw=raw,
@@ -246,7 +259,15 @@ class ReplayIterator:
                 try:
                     raw = JsonDecoder.loads(line)
 
-                    yield EventParser.parse(raw)
+                    event = EventParser.parse(raw)
+
+                    if event is None:
+                        #
+                        # Ignore non-trade actions.
+                        #
+                        continue
+
+                    yield event
 
                 except Exception:
                     #

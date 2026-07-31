@@ -90,17 +90,17 @@ class Objective:
         for feature in features:
             weights[feature] = trial.suggest_float(f"w_{feature}", -5.0, 5.0)
 
-        min_liquidity = trial.suggest_float("min_liquidity", 1_000, 200_000)
-        min_market_cap = trial.suggest_float("min_market_cap", 5_000, 500_000)
+        min_liquidity = trial.suggest_float("min_liquidity", 1.0, 2_000)
+        min_market_cap = trial.suggest_float("min_market_cap", 10, 10_000)
 
         return StrategyConfig(
             min_price_change_5=trial.suggest_float("min_price_change_5", -0.30, 0.50),
             min_price_change_20=trial.suggest_float("min_price_change_20", -0.50, 1.00),
             min_liquidity=min_liquidity,
-            max_liquidity=trial.suggest_float("max_liquidity", min_liquidity, 5_000_000),
+            max_liquidity=trial.suggest_float("max_liquidity", min_liquidity, 50_000),
             min_market_cap=min_market_cap,
-            max_market_cap=trial.suggest_float("max_market_cap", min_market_cap, 10_000_000),
-            min_volume=trial.suggest_float("min_volume", 100, 500_000),
+            max_market_cap=trial.suggest_float("max_market_cap", min_market_cap, 200_000),
+            min_volume=trial.suggest_float("min_volume", 0.5, 200),
             min_buy_ratio=trial.suggest_float("min_buy_ratio", 0.10, 0.95),
             min_trades=trial.suggest_int("min_trades", 1, 500),
             min_wallets=trial.suggest_int("min_wallets", 1, 300),
