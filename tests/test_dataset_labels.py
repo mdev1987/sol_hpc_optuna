@@ -32,6 +32,23 @@ def test_labels_contain_both_classes():
     assert 1 in labels and 0 in labels
 
 
+def test_zero_and_nan_prices_do_not_raise_or_label():
+    import numpy as np
+
+    df = pl.DataFrame(
+        {
+            "mint": ["A"] * 6,
+            "timestamp": list(range(0, 60, 10)),
+            "slot": list(range(6)),
+            "price": [0.0, float("nan"), 1.0, 2.0, 0.0, 4.0],
+            "price_change_5": [0.0] * 6,
+        }
+    )
+    config = SimulatorConfig(take_profit=0.5, ttl_seconds=100)
+    labels = np.asarray(_labels(df, config))
+    assert labels.tolist() == [0, 0, 1, 1, 0, 0]
+
+
 def test_balanced_build_equal_counts(tmp_path):
     config = SimulatorConfig(take_profit=0.5, ttl_seconds=100)
     out = tmp_path / "dataset.parquet"

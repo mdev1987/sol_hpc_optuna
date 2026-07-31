@@ -145,7 +145,10 @@ class DatasetBuilder:
             while j + 1 < m and ts[j + 1] - ts[i] <= ttl:
                 j += 1
             if j > i:
+                base = prices[i]
+                if not (base > 0):
+                    continue
                 window = prices[i + 1 : j + 1]
-                max_gain = window.max() / prices[i] - 1.0
+                max_gain = window.max() / base - 1.0
                 if max_gain >= target - 1.0:
                     labels[idx[i]] = 1
