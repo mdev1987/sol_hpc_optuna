@@ -25,3 +25,6 @@ replay-optuna = "hpc_replay:app"
 
 [tool.uv]
 package = false
+
+[dependency-groups]
+dev = ["pytest>=8"]

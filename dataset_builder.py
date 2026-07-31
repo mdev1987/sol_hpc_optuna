@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from typing import Iterable
 
-from feature_engine import FeatureSnapshot
-from simulator import ExitReason, SimulatorConfig, Simulator, WeightedStrategy
+from simulator import SimulatorConfig
 
 
 @dataclass(slots=True)
@@ -29,22 +27,37 @@ class TrainingDataset:
 
 
 class DatasetBuilder:
-    def __init__(self, config: SimulatorConfig, strategy: WeightedStrategy | None = None):
+    def __init__(self, config: SimulatorConfig):
         self.config = config
-        self.strategy = strategy
 
-    def build(self, features_df, progress=None, task_id=None, output=None) -> int:
+    def build(self, features_df, progress=None, task_id=None, output=None, balanced: bool = True) -> int:
         """
         Build a labeled training dataset from a features DataFrame.
 
         Labels are forward-looking: a sample is positive (1) if its price
         reaches `take_profit` within `ttl_seconds`, computed per-mint with
         a two-pointer scan (O(n) per mint, no per-snapshot simulator).
+
+        With `balanced=True`, the dataset is subsampled to equal positive
+        and negative samples (shuffled) to avoid class imbalance.
         """
         import numpy as np
         import polars as pl
 
-        labels = self._compute_labels(features_df)
+        labels = np.asarray(self._compute_labels(features_df), dtype=np.int8)
+
+        if balanced and labels.size:
+            pos = np.flatnonzero(labels == 1)
+            neg = np.flatnonzero(labels == 0)
+            if pos.size and neg.size:
+                count = min(pos.size, neg.size)
+                rng = random.Random(42)
+                keep = np.concatenate(
+                    (rng.sample(pos.tolist(), count), rng.sample(neg.tolist(), count))
+                )
+                keep = np.sort(keep)
+                features_df = features_df[keep]
+                labels = labels[keep]
 
         meta = {"mint", "timestamp", "slot"}
         feature_cols = [c for c in features_df.columns if c not in meta and c != "label"]
@@ -136,49 +149,3 @@ class DatasetBuilder:
                 max_gain = window.max() / prices[i] - 1.0
                 if max_gain >= target - 1.0:
                     labels[idx[i]] = 1
-
-
-class BalancedDatasetBuilder:
-    def __init__(self, config: SimulatorConfig, strategy: WeightedStrategy):
-        self.config = config
-        self.strategy = strategy
-
-    def build(self, snapshots: Iterable[FeatureSnapshot]) -> TrainingDataset:
-        profitable: list[TrainingSample] = []
-        unprofitable: list[TrainingSample] = []
-
-        for snapshot in snapshots:
-            score = self.strategy.score(snapshot)
-            if score < self.strategy.config.minimum_score:
-                continue
-
-            sample = TrainingSample(features=dict(snapshot.features), label=0)
-            result = self._simulate_single(snapshot)
-            if result > 0:
-                sample.label = 1
-                profitable.append(sample)
-            else:
-                unprofitable.append(sample)
-
-        count = min(len(profitable), len(unprofitable)) if profitable and unprofitable else 0
-        if count == 0:
-            combined = profitable + unprofitable
-            return TrainingDataset(samples=combined)
-
-        random.shuffle(profitable)
-        random.shuffle(unprofitable)
-
-        balanced = profitable[:count] + unprofitable[:count]
-        random.shuffle(balanced)
-
-        return TrainingDataset(samples=balanced)
-
-    def _simulate_single(self, snapshot: FeatureSnapshot) -> float:
-        simulator = Simulator(self.config, self.strategy)
-        simulator.portfolio.open_position(snapshot)
-        price = snapshot.features["price"]
-        timestamp = snapshot.timestamp + self.config.ttl_seconds
-        simulator.portfolio.close_position(
-            snapshot.mint, price, timestamp, ExitReason.TTL
-        )
-        return simulator.portfolio.closed[-1].pnl

@@ -211,6 +211,7 @@ class StrategyConfig:
     min_liquidity_velocity: float | None = None
     weights: dict[str, float] = field(default_factory=dict)
     minimum_score: float = 0.50
+    scaler: dict[str, tuple[float, float]] | None = None
 
 
 class RiskManager:
@@ -260,10 +261,14 @@ class WeightedStrategy(Strategy):
 
     def score(self, snapshot: FeatureSnapshot) -> float:
         features = snapshot.features
+        scaler = self.config.scaler or {}
         score = 0.0
         total_weight = 0.0
         for feature, weight in self.config.weights.items():
             value = features.get(feature, 0.0)
+            if feature in scaler:
+                mean, std = scaler[feature]
+                value = (value - mean) / std if std > 0 else 0.0
             score += value * weight
             total_weight += abs(weight)
         if total_weight == 0:
@@ -356,13 +361,19 @@ class Simulator:
         )
 
     def run(self, snapshots: Iterable[FeatureSnapshot]) -> SimulationResult:
+        last_price: dict[str, float] = {}
+        last_time: dict[str, int] = {}
         for snapshot in snapshots:
+            last_price[snapshot.mint] = snapshot.features["price"]
+            last_time[snapshot.mint] = snapshot.timestamp
             self._update_positions(snapshot)
             self._update_entries(snapshot)
 
         for mint in list(self.portfolio.positions.keys()):
             position = self.portfolio.positions[mint]
-            self.portfolio.close_position(mint, position.entry_price, position.entry_time, ExitReason.MANUAL)
+            price = last_price.get(mint, position.entry_price)
+            timestamp = last_time.get(mint, position.entry_time)
+            self.portfolio.close_position(mint, price, timestamp, ExitReason.MANUAL)
 
         return self._result()
 
