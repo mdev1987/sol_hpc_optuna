@@ -31,6 +31,14 @@ def _dataset_arrays(dataset: TrainingDataset, names: list[str] | None = None):
     return X, y, names
 
 
+def _safe_corrcoef(X: np.ndarray) -> np.ndarray:
+    with np.errstate(invalid="ignore", divide="ignore"):
+        corr = np.corrcoef(X, rowvar=False)
+    corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+    np.fill_diagonal(corr, 1.0)
+    return corr
+
+
 class RandomForestSelector:
     def __init__(self, n_estimators: int = 100, max_depth: int = 10, min_samples: int = 100, cumulative_threshold: float = 0.95):
         self.n_estimators = n_estimators
@@ -98,7 +106,7 @@ class CorrelationFilter:
         feature_names = [f.name for f in importance]
         X, _, _ = _dataset_arrays(dataset, feature_names)
 
-        corr = np.corrcoef(X.T)
+        corr = _safe_corrcoef(X)
         removed: set[int] = set()
 
         for i in range(len(feature_names)):
@@ -203,7 +211,7 @@ class FeatureSelector:
             progress.update(task_id, description="Filtering correlated features...")
 
         corr_X = frame.select([f.name for f in importance]).to_numpy()
-        corr = np.corrcoef(corr_X.T)
+        corr = _safe_corrcoef(corr_X)
         removed: set[int] = set()
         n = len(importance)
         for i in range(n):
