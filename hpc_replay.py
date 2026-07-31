@@ -184,7 +184,7 @@ def _parse_one_file(file: Path, output: Path, batch_size: int = 100_000) -> int:
 
     writer = ReplayParquetWriter(output, compression="snappy")
     writer.write(ReplayFile(file).events(), batch_size=batch_size)
-    return file
+    return 1
 
 
 def _parse_replay(workers: int = CPU_WORKERS) -> None:
@@ -215,11 +215,17 @@ def _parse_replay(workers: int = CPU_WORKERS) -> None:
     with _parse_progress() as progress:
         task = progress.add_task("Parsing", total=len(files))
         with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = [
-                pool.submit(_parse_one_file, f, parts_dir / f"{f.stem}.parquet")
+            futures = {
+                pool.submit(_parse_one_file, f, parts_dir / f"{f.stem}.parquet"): f
                 for f in files
-            ]
-            for _ in as_completed(futures):
+            }
+            for fut in as_completed(futures):
+                file = futures[fut]
+                try:
+                    fut.result()
+                except Exception:
+                    log.error(f"Failed to parse {file.name}")
+                    raise
                 progress.advance(task)
 
     tables = [pq.read_table(p) for p in sorted(parts_dir.glob("*.parquet"))]
