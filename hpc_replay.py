@@ -76,6 +76,8 @@ def run(
     download_workers: int = DOWNLOAD_WORKERS,
     clean: bool = True,
     resume: bool = False,
+    label_tp: float = 0.50,
+    label_ttl: int = 600,
     skip_download: bool = False,
     skip_parse: bool = False,
     skip_features: bool = False,
@@ -90,6 +92,7 @@ def run(
     print(f"  Days      : {days}")
     print(f"  Trials    : {trials}")
     print(f"  Workers   : {workers}")
+    print(f"  Label     : TP {label_tp:.0%} / TTL {label_ttl}s")
     print(f"  Auto-clean: {clean}")
     print(f"  Storage   : sqlite:///{OPTUNA_DB}")
     print(f"  Resume    : {resume}")
@@ -122,7 +125,7 @@ def run(
 
     if not skip_dataset:
         log.info("Stage 4/6: Building labeled dataset...")
-        _build_dataset()
+        _build_dataset(label_tp=label_tp, label_ttl=label_ttl)
         log.info("Dataset complete.")
     else:
         log.info("Skipping dataset.")
@@ -234,7 +237,7 @@ def _build_features() -> None:
     log.info(f"Features saved: {features_path} ({written} rows)")
 
 
-def _build_dataset() -> None:
+def _build_dataset(label_tp: float = 0.50, label_ttl: int = 600) -> None:
     import polars as pl
 
     from dataset_builder import DatasetBuilder
@@ -252,7 +255,7 @@ def _build_dataset() -> None:
         log.info("Training dataset cache exists, skipping.")
         return
 
-    builder = DatasetBuilder(SimulatorConfig())
+    builder = DatasetBuilder(SimulatorConfig(take_profit=label_tp, ttl_seconds=label_ttl))
 
     with _parquet_progress() as progress:
         task = progress.add_task("Labeling candidates", total=len(df))

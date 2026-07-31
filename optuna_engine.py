@@ -152,10 +152,41 @@ class Objective:
         return score
 
 
+def _is_transient_storage_error(exc: Exception) -> bool:
+    """Storage failures worth retrying: SQLite lock/commit errors and the
+    known optuna `_optimize.py` UnboundLocalError triggered by them."""
+    import optuna.exceptions
+    import sqlalchemy.exc
+
+    if isinstance(exc, (optuna.exceptions.StorageInternalError, sqlalchemy.exc.OperationalError)):
+        return True
+    if isinstance(exc, UnboundLocalError):
+        message = str(exc)
+        return any(name in message for name in ("updated_state", "updated_sate", "frozen_trial"))
+    return False
+
+
 class Optimizer:
     def __init__(self, config: OptunaConfig):
         self.config = config
         self.dataset = SnapshotDataset(config.dataset)
+
+    def _storage(self) -> optuna.storages.RDBStorage:
+        from optuna.storages import RDBStorage
+
+        engine_kwargs = None
+        if self.config.storage.startswith("sqlite:///"):
+            db_path = self.config.storage.replace("sqlite:///", "", 1)
+            try:
+                import sqlite3
+
+                con = sqlite3.connect(db_path, timeout=60)
+                con.execute("PRAGMA journal_mode=WAL")
+                con.close()
+            except Exception:
+                pass
+            engine_kwargs = {"connect_args": {"timeout": 60}}
+        return RDBStorage(url=self.config.storage, engine_kwargs=engine_kwargs)
 
     def study(self) -> optuna.Study:
         sampler = optuna.samplers.TPESampler(seed=self.config.seed, multivariate=True)
@@ -163,7 +194,7 @@ class Optimizer:
 
         return optuna.create_study(
             study_name=self.config.study_name,
-            storage=self.config.storage,
+            storage=self._storage(),
             load_if_exists=True,
             direction=self.config.direction,
             sampler=sampler,
@@ -171,16 +202,30 @@ class Optimizer:
         )
 
     def run(self) -> OptimizationResult:
-        study = self.study()
         objective = Objective(self.config, self.dataset)
+        max_attempts = 5
 
-        study.optimize(
-            objective,
-            n_trials=self.config.trials,
-            timeout=self.config.timeout,
-            n_jobs=self.config.jobs,
-            show_progress_bar=True,
-        )
+        for attempt in range(1, max_attempts + 1):
+            try:
+                study = self.study()
+                study.optimize(
+                    objective,
+                    n_trials=self.config.trials,
+                    timeout=self.config.timeout,
+                    n_jobs=self.config.jobs,
+                    show_progress_bar=True,
+                )
+                break
+            except Exception as e:
+                if not _is_transient_storage_error(e):
+                    raise
+                if attempt == max_attempts:
+                    raise
+                print(f"\n[bold yellow]Transient storage error ({e}); retrying in 10s "
+                      f"(attempt {attempt + 1}/{max_attempts})...[/]")
+                import time
+
+                time.sleep(10)
 
         best = study.best_trial
         result = OptimizationResult(
