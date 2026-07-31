@@ -186,6 +186,18 @@ def _parse_replay() -> None:
     log.info(f"Parquet saved: {parquet_path}")
 
 
+def _migrate_features_schema(path: Path) -> bool:
+    import polars as pl
+
+    df = pl.read_parquet(path)
+    if "features" not in df.columns:
+        return False
+    df = df.unnest("features")
+    df.write_parquet(path)
+    log.info(f"Migrated features schema to flat columns: {path}")
+    return True
+
+
 def _build_features() -> None:
     import polars as pl
     from feature_engine import build_features_from_parquet
@@ -203,8 +215,12 @@ def _build_features() -> None:
         if "price" in schema.names and "liquidity" in schema.names:
             log.info("Features cache exists, skipping.")
             return
-        log.warning("Stale features schema detected, rebuilding.")
-        features_path.unlink()
+        log.info("Stale nested-schema features detected, migrating in place...")
+        if not _migrate_features_schema(features_path):
+            log.warning("Migration failed, rebuilding from scratch.")
+            features_path.unlink()
+        else:
+            return
 
     df = pl.read_parquet(parquet_path)
     total_events = len(df)
