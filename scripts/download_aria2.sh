@@ -32,6 +32,10 @@ command -v aria2c >/dev/null 2>&1 || { echo "aria2c not found. Install: sudo apt
 
 mkdir -p "${DOWNLOAD_DIR}"
 
+# Remove stale control files from interrupted/pre-flag runs; the server
+# cannot resume partial files, so resuming is never possible anyway.
+find "${DOWNLOAD_DIR}" -name "*.aria2" -delete
+
 total_files=0
 for d in $(seq 0 $((DAYS - 1))); do
     # Previous N UTC days ending yesterday.
@@ -50,6 +54,7 @@ for d in $(seq 0 $((DAYS - 1))); do
         -x 1 -s 1 \
         --auto-file-renaming=false \
         --allow-overwrite=false \
+        --remove-control-file=true \
         --console-log-level=warn \
         --summary-interval=0 \
         -d "${DOWNLOAD_DIR}/${yyyy}/${mm}/${dd}" \
