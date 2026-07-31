@@ -46,6 +46,7 @@ from constants import (
     TIMEOUT,
     USER_AGENT,
 )
+from parser import is_valid_zstd
 
 # ------------------------------------------------------------
 # Configuration
@@ -200,8 +201,10 @@ class ReplayDownloader:
         assert self.client is not None
 
         if replay.path.exists():
-            self._advance()
-            return
+            if is_valid_zstd(replay.path):
+                self._advance()
+                return
+            replay.path.unlink()
 
         replay.directory.mkdir(
             parents=True,
@@ -224,6 +227,11 @@ class ReplayDownloader:
                     with replay.temporary.open("wb") as fp:
                         async for chunk in response.aiter_bytes():
                             fp.write(chunk)
+
+                if not is_valid_zstd(replay.temporary):
+                    raise RuntimeError(
+                        f"Corrupt zstd stream for {replay.url}"
+                    )
 
                 os.replace(
                     replay.temporary,

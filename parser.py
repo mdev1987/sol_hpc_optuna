@@ -86,6 +86,27 @@ class ReplayEvent:
 # ------------------------------------------------------------
 
 
+def is_valid_zstd(path: str | Path) -> bool:
+    """
+    True if the file is a complete, non-corrupt Zstandard stream.
+
+    Decompresses the whole stream (discarding output) so truncation or
+    corruption anywhere in the file is caught, not just at the start.
+    """
+
+    try:
+        with Path(path).open("rb") as fp:
+            dctx = zstd.ZstdDecompressor()
+            with dctx.stream_reader(fp) as reader:
+                while reader.read(4 * 1024 * 1024):
+                    pass
+        return True
+    except zstd.ZstdError:
+        return False
+    except OSError:
+        return False
+
+
 class ReplayReader:
     """
     Streaming Zstandard reader.
