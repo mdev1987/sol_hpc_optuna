@@ -60,6 +60,17 @@ def _parquet_progress() -> Progress:
     )
 
 
+def _parse_progress() -> Progress:
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[cyan]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total} files"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+    )
+
+
 def _indeterminate_progress() -> Progress:
     return Progress(
         SpinnerColumn(),
@@ -107,7 +118,7 @@ def run(
 
     if not skip_parse:
         log.info("Stage 2/6: Parsing replay to Parquet...")
-        _parse_replay()
+        _parse_replay(workers=workers)
         log.info("Parsing complete.")
         if clean:
             _rm(DOWNLOAD_DIR)
@@ -167,26 +178,56 @@ def _valid_parquet(path: Path) -> bool:
         return False
 
 
-def _parse_replay() -> None:
-    import polars as pl
-    from parser import replay_to_parquet
+def _parse_one_file(file: Path, output: Path, batch_size: int = 100_000) -> int:
+    """Parse a single hourly archive into its own Parquet part."""
+    from parser import ReplayFile, ReplayParquetWriter
+
+    writer = ReplayParquetWriter(output, compression="snappy")
+    writer.write(ReplayFile(file).events(), batch_size=batch_size)
+    return file
+
+
+def _parse_replay(workers: int = CPU_WORKERS) -> None:
+    """Parse all hourly archives in parallel, then merge into one Parquet.
+
+    A fresh output is always produced: the old "valid parquet, skip" check
+    only verified metadata, so a partial file from a crashed run was treated
+    as complete. The final file is written only after all parts succeed.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
     parquet_path = PARQUET_DIR / "replay.parquet"
-    if _valid_parquet(parquet_path):
-        log.info("Parquet cache exists, skipping.")
-        return
-    elif parquet_path.exists():
-        log.warning("Corrupt parquet removed, re-parsing.")
+    if parquet_path.exists():
+        parquet_path.unlink()
 
-    total_events = 0
-    for f in sorted(DOWNLOAD_DIR.rglob("*.jsonl.zst")):
-        total_events += 1
+    files = sorted(DOWNLOAD_DIR.rglob("*.jsonl.zst"))
+    if not files:
+        log.error(f"No replay files found in {DOWNLOAD_DIR}")
+        sys.exit(1)
 
-    with _parquet_progress() as progress:
-        task = progress.add_task("Parsing", total=total_events)
-        replay_to_parquet(DOWNLOAD_DIR, parquet_path, batch_size=100_000, progress=progress, task_id=task)
+    parts_dir = PARQUET_DIR / "parts"
+    if parts_dir.exists():
+        shutil.rmtree(parts_dir)
+    parts_dir.mkdir(parents=True, exist_ok=True)
 
-    log.info(f"Parquet saved: {parquet_path}")
+    with _parse_progress() as progress:
+        task = progress.add_task("Parsing", total=len(files))
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(_parse_one_file, f, parts_dir / f"{f.stem}.parquet")
+                for f in files
+            ]
+            for _ in as_completed(futures):
+                progress.advance(task)
+
+    tables = [pq.read_table(p) for p in sorted(parts_dir.glob("*.parquet"))]
+    merged = pa.concat_tables(tables)
+    pq.write_table(merged, parquet_path, compression="snappy")
+    shutil.rmtree(parts_dir)
+
+    log.info(f"Parquet saved: {parquet_path} ({merged.num_rows} rows)")
 
 
 def _migrate_features_schema(path: Path) -> bool:
@@ -350,10 +391,12 @@ def download(
 
 
 @app.command()
-def parse():
+def parse(
+    workers: int = CPU_WORKERS,
+):
     """Parse downloaded replay to Parquet only."""
     init_directories()
-    _parse_replay()
+    _parse_replay(workers=workers)
 
 
 @app.command()
