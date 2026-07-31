@@ -205,18 +205,18 @@ def _build_features() -> None:
 
     with _parquet_progress() as progress:
         task = progress.add_task("Features", total=total_events)
-        features_df = build_features_from_parquet(df, progress=progress, task_id=task)
+        written = build_features_from_parquet(
+            df, progress=progress, task_id=task, output=features_path
+        )
 
-    features_df.write_parquet(features_path)
-    log.info(f"Features saved: {features_path} ({len(features_df)} rows)")
+    log.info(f"Features saved: {features_path} ({written} rows)")
 
 
 def _build_dataset() -> None:
     import polars as pl
 
     from dataset_builder import DatasetBuilder
-    from feature_engine import FeatureSnapshot
-    from simulator import SimulatorConfig, WeightedStrategy, StrategyConfig
+    from simulator import SimulatorConfig
 
     features_path = CACHE_DIR / "features.parquet"
     if not features_path.exists():
@@ -224,50 +224,20 @@ def _build_dataset() -> None:
         sys.exit(1)
 
     df = pl.read_parquet(features_path)
-    ignore = {"mint", "timestamp", "slot"}
-    feature_cols = [c for c in df.columns if c not in ignore]
-
-    with _parquet_progress() as progress:
-        task = progress.add_task("Loading snapshots", total=len(df))
-        snapshots = []
-        for row in df.iter_rows(named=True):
-            snapshots.append(
-                FeatureSnapshot(
-                    mint=row["mint"],
-                    timestamp=row["timestamp"],
-                    slot=row["slot"],
-                    features={c: row[c] for c in feature_cols},
-                )
-            )
-            progress.advance(task)
-
-    strategy = WeightedStrategy(
-        StrategyConfig(
-            min_price_change_5=-0.30,
-            min_liquidity=1_000,
-            max_liquidity=5_000_000,
-            min_market_cap=5_000,
-            max_market_cap=10_000_000,
-            min_volume=100,
-            min_buy_ratio=0.10,
-            min_trades=1,
-            min_wallets=1,
-            minimum_score=0.0,
-        )
-    )
-
-    builder = DatasetBuilder(SimulatorConfig(), strategy)
-
-    with _parquet_progress() as progress:
-        task = progress.add_task("Evaluating candidates", total=len(snapshots))
-        dataset = builder.build(snapshots, progress=progress, task_id=task)
 
     dataset_path = CACHE_DIR / "training_dataset.parquet"
-    rows = [{**s.features, "label": s.label} for s in dataset.samples]
-    if rows:
-        df = pl.DataFrame(rows)
-        df.write_parquet(dataset_path)
-        log.info(f"Dataset saved: {dataset_path} ({len(df)} rows)")
+    if _valid_parquet(dataset_path):
+        log.info("Training dataset cache exists, skipping.")
+        return
+
+    builder = DatasetBuilder(SimulatorConfig())
+
+    with _parquet_progress() as progress:
+        task = progress.add_task("Labeling candidates", total=len(df))
+        written = builder.build(df, progress=progress, task_id=task, output=dataset_path)
+
+    if written:
+        log.info(f"Dataset saved: {dataset_path} ({written} rows)")
     else:
         log.warning("No samples generated.")
 
@@ -275,32 +245,20 @@ def _build_dataset() -> None:
 def _select_features() -> None:
     import polars as pl
 
-    from dataset_builder import TrainingDataset
     from feature_selection import FeatureSelector
 
     dataset_path = CACHE_DIR / "training_dataset.parquet"
-    if not dataset_path.exists():
-        log.error(f"Dataset not found: {dataset_path}")
+    if not _valid_parquet(dataset_path):
+        log.error(f"Dataset not found or corrupt: {dataset_path}")
         sys.exit(1)
 
     df = pl.read_parquet(dataset_path)
-    dicts = df.to_dicts()
-
-    with _parquet_progress() as progress:
-        task = progress.add_task("Loading dataset", total=len(dicts))
-        dataset = TrainingDataset()
-        for d in dicts:
-            features = {k: v for k, v in d.items() if k != "label"}
-            dataset.samples.append(
-                type("Sample", (), {"features": features, "label": d["label"]})()
-            )
-            progress.advance(task)
 
     selector = FeatureSelector()
 
     with _indeterminate_progress() as progress:
         task = progress.add_task("Training Random Forest...", total=None)
-        result = selector.select(dataset)
+        result = selector.select_from_frame(df)
         progress.update(task, description=f"Selected {len(result.features)} features")
 
     selection_path = CACHE_DIR / "selected_features.json"

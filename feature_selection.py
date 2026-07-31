@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from dataset_builder import TrainingDataset
 
 
@@ -17,6 +19,18 @@ class SelectionResult:
     importance: list[FeatureImportance]
 
 
+def _dataset_arrays(dataset: TrainingDataset, names: list[str] | None = None):
+    if names is None:
+        names = list(dataset.samples[0].features.keys())
+    X = np.empty((len(dataset), len(names)), dtype=np.float64)
+    y = np.empty(len(dataset), dtype=np.int32)
+    for i, s in enumerate(dataset.samples):
+        for j, f in enumerate(names):
+            X[i, j] = s.features[f]
+        y[i] = s.label
+    return X, y, names
+
+
 class RandomForestSelector:
     def __init__(self, n_estimators: int = 100, max_depth: int = 10, min_samples: int = 100, cumulative_threshold: float = 0.95):
         self.n_estimators = n_estimators
@@ -28,12 +42,9 @@ class RandomForestSelector:
         if len(dataset) < self.min_samples:
             return SelectionResult(features=[], importance=[])
 
-        import numpy as np
         from sklearn.ensemble import RandomForestClassifier
 
-        feature_names = list(dataset.samples[0].features.keys())
-        X = np.array([[s.features[f] for f in feature_names] for s in dataset.samples], dtype=np.float64)
-        y = np.array([s.label for s in dataset.samples], dtype=np.int32)
+        X, y, feature_names = _dataset_arrays(dataset)
 
         clf = RandomForestClassifier(
             n_estimators=self.n_estimators,
@@ -84,13 +95,8 @@ class CorrelationFilter:
         if len(dataset) < self.config.min_features:
             return [f.name for f in importance]
 
-        import numpy as np
-
         feature_names = [f.name for f in importance]
-        X = np.array(
-            [[s.features[f] for f in feature_names] for s in dataset.samples],
-            dtype=np.float64,
-        )
+        X, _, _ = _dataset_arrays(dataset, feature_names)
 
         corr = np.corrcoef(X.T)
         removed: set[int] = set()
@@ -115,12 +121,7 @@ class LowVarianceFilter:
         if len(dataset) < self.config.min_features:
             return candidates
 
-        import numpy as np
-
-        X = np.array(
-            [[s.features[f] for f in candidates] for s in dataset.samples],
-            dtype=np.float64,
-        )
+        X, _, _ = _dataset_arrays(dataset, candidates)
         variances = np.var(X, axis=0)
         return [f for idx, f in enumerate(candidates) if variances[idx] >= self.config.variance_threshold]
 
@@ -153,6 +154,77 @@ class FeatureSelector:
             filtered = rf_result.features[:5]
 
         filtered_importance = [f for f in rf_result.importance if f.name in filtered]
+
+        if progress is not None and task_id is not None:
+            progress.update(task_id, advance=1)
+
+        return SelectionResult(features=filtered, importance=filtered_importance)
+
+    def select_from_frame(self, frame, label_column: str = "label", progress=None, task_id=None) -> SelectionResult:
+        import polars as pl
+
+        feature_names = [c for c in frame.columns if c != label_column]
+        X = frame.select(feature_names).to_numpy()
+        y = frame[label_column].to_numpy().astype(np.int32)
+
+        if len(X) < self.rf_selector.min_samples:
+            return SelectionResult(features=[], importance=[])
+
+        from sklearn.ensemble import RandomForestClassifier
+
+        clf = RandomForestClassifier(
+            n_estimators=self.rf_selector.n_estimators,
+            max_depth=self.rf_selector.max_depth,
+            random_state=42,
+            n_jobs=-1,
+        )
+        clf.fit(X, y)
+
+        importance = [
+            FeatureImportance(name=name, importance=imp)
+            for name, imp in sorted(
+                zip(feature_names, clf.feature_importances_, strict=False),
+                key=lambda x: x[1],
+                reverse=True,
+            )
+        ]
+
+        cumulative = 0.0
+        selected: list[str] = []
+        for feat in importance:
+            cumulative += feat.importance
+            selected.append(feat.name)
+            if cumulative >= self.rf_selector.cumulative_threshold:
+                break
+        if not selected:
+            selected = [f.name for f in importance]
+
+        if progress is not None and task_id is not None:
+            progress.update(task_id, description="Filtering correlated features...")
+
+        corr_X = frame.select([f.name for f in importance]).to_numpy()
+        corr = np.corrcoef(corr_X.T)
+        removed: set[int] = set()
+        n = len(importance)
+        for i in range(n):
+            if i in removed:
+                continue
+            for j in range(i + 1, n):
+                if j in removed:
+                    continue
+                if abs(corr[i, j]) > self.corr_filter.config.correlation_threshold:
+                    removed.add(j)
+
+        filtered = [f.name for idx, f in enumerate(importance) if idx not in removed]
+
+        var_X = frame.select(filtered).to_numpy()
+        variances = np.var(var_X, axis=0)
+        filtered = [f for idx, f in enumerate(filtered) if variances[idx] >= self.var_filter.config.variance_threshold]
+
+        if not filtered:
+            filtered = selected[:5]
+
+        filtered_importance = [f for f in importance if f.name in filtered]
 
         if progress is not None and task_id is not None:
             progress.update(task_id, advance=1)

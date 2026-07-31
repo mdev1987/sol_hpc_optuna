@@ -37,17 +37,23 @@ class SnapshotDataset:
         import polars as pl
 
         self.frame = pl.read_parquet(path)
+        self.ignore = {"mint", "timestamp", "slot"}
+        self.feature_columns = [c for c in self.frame.columns if c not in self.ignore]
+        self._mints = self.frame["mint"].to_list()
+        self._timestamps = self.frame["timestamp"].to_numpy()
+        self._slots = self.frame["slot"].to_numpy()
+        self._features = self.frame.select(self.feature_columns).to_numpy()
 
     def snapshots(self):
-        ignore = {"mint", "timestamp", "slot"}
-        feature_columns = [c for c in self.frame.columns if c not in ignore]
-
-        for row in self.frame.iter_rows(named=True):
+        for i in range(len(self._features)):
             yield FeatureSnapshot(
-                mint=row["mint"],
-                timestamp=row["timestamp"],
-                slot=row["slot"],
-                features={feature: row[feature] for feature in feature_columns},
+                mint=self._mints[i],
+                timestamp=int(self._timestamps[i]),
+                slot=int(self._slots[i]),
+                features={
+                    feature: float(self._features[i, j])
+                    for j, feature in enumerate(self.feature_columns)
+                },
             )
 
 

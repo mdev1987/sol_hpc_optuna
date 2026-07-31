@@ -421,34 +421,54 @@ def build_features(events):
         yield engine.update(event)
 
 
-def build_features_from_parquet(df, batch_size: int = 100_000, progress=None, task_id=None):
+def build_features_from_parquet(df, batch_size: int = 100_000, progress=None, task_id=None, output=None) -> int:
     import dataclasses
-
-    engine = FeatureEngine()
-    snapshots: list[FeatureSnapshot] = []
-
-    total_rows = len(df)
-    for start in range(0, total_rows, batch_size):
-        batch = df[start : start + batch_size]
-        for row in batch.iter_rows(named=True):
-            event = ReplayEvent(
-                timestamp=row.get("timestamp", 0),
-                signature=row.get("signature", ""),
-                slot=row.get("slot", 0),
-                mint=row.get("mint", ""),
-                trader=row.get("trader", ""),
-                side=row.get("side", ""),
-                amount=float(row.get("amount", 0)),
-                price=float(row.get("price", 0)),
-                market_cap=float(row.get("market_cap", 0)),
-                liquidity=float(row.get("liquidity", 0)),
-                raw=row,
-            )
-            snapshots.append(engine.update(event))
-        if progress is not None and task_id is not None:
-            progress.update(task_id, advance=len(batch))
-
-    dicts = [dataclasses.asdict(s) for s in snapshots]
     import polars as pl
 
-    return pl.from_dicts(dicts)
+    engine = FeatureEngine()
+    total_rows = len(df)
+    writer = None
+    written = 0
+
+    try:
+        for start in range(0, total_rows, batch_size):
+            batch = df[start : start + batch_size]
+            snapshots: list[FeatureSnapshot] = []
+            for row in batch.iter_rows(named=True):
+                event = ReplayEvent(
+                    timestamp=row.get("timestamp", 0),
+                    signature=row.get("signature", ""),
+                    slot=row.get("slot", 0),
+                    mint=row.get("mint", ""),
+                    trader=row.get("trader", ""),
+                    side=row.get("side", ""),
+                    amount=float(row.get("amount", 0)),
+                    price=float(row.get("price", 0)),
+                    market_cap=float(row.get("market_cap", 0)),
+                    liquidity=float(row.get("liquidity", 0)),
+                    raw=row,
+                )
+                snapshots.append(engine.update(event))
+
+            if output is not None and snapshots:
+                import pyarrow.parquet as pq
+
+                dicts = [dataclasses.asdict(s) for s in snapshots]
+                frame = pl.from_dicts(dicts)
+                table = frame.to_arrow()
+                if writer is None:
+                    writer = pq.ParquetWriter(
+                        output,
+                        table.schema,
+                        compression="snappy",
+                    )
+                writer.write_table(table)
+                written += len(frame)
+
+            if progress is not None and task_id is not None:
+                progress.update(task_id, advance=len(batch))
+    finally:
+        if writer is not None:
+            writer.close()
+
+    return written
