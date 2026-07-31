@@ -91,16 +91,21 @@ def is_valid_zstd(path: str | Path) -> bool:
     True if the file is a complete, non-corrupt Zstandard stream.
 
     Decompresses the whole stream (discarding output) so truncation or
-    corruption anywhere in the file is caught, not just at the start.
+    corruption anywhere in the file is caught. ``decompressobj`` is used
+    rather than ``stream_reader`` because the latter can silently return
+    EOF on a prematurely-terminated stream.
     """
 
     try:
         with Path(path).open("rb") as fp:
             dctx = zstd.ZstdDecompressor()
-            with dctx.stream_reader(fp) as reader:
-                while reader.read(4 * 1024 * 1024):
-                    pass
-        return True
+            dobj = dctx.decompressobj()
+            while True:
+                chunk = fp.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                dobj.decompress(chunk)
+            return bool(dobj.eof)
     except zstd.ZstdError:
         return False
     except OSError:
