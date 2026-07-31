@@ -153,7 +153,15 @@ def _valid_parquet(path: Path) -> bool:
     if path.stat().st_size < 1024:
         path.unlink()
         return False
-    return True
+    try:
+        import pyarrow.parquet as pq
+
+        pq.read_metadata(path)
+        return True
+    except Exception:
+        log.warning(f"Corrupt parquet detected, removing: {path}")
+        path.unlink()
+        return False
 
 
 def _parse_replay() -> None:

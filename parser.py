@@ -648,7 +648,14 @@ class ReplayParquetWriter:
     @staticmethod
     def _primitive_columns(frame) -> list[str]:
         import polars as pl
-        return [c for c, t in zip(frame.columns, frame.dtypes, strict=False) if t not in (pl.Object, pl.Struct)]
+        columns = [c for c in frame.columns if c != "raw"]
+        kept: list[str] = []
+        for c in columns:
+            base = frame.schema[c].base_type()
+            if base in (pl.Struct, pl.Object):
+                continue
+            kept.append(c)
+        return kept
 
     def write(
         self,
