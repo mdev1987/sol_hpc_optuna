@@ -420,6 +420,7 @@ def _run_optuna(
     resume: bool,
     bundle: str | None = None,
     validation_fraction: float = 0.2,
+    sample_fraction: float = 1.0,
 ) -> None:
     from optuna_engine import Optimizer, OptunaConfig
 
@@ -466,7 +467,14 @@ def _run_optuna(
         seed=CONFIG.random_seed,
         selected_features=selected_features,
         validation_fraction=validation_fraction,
+        sample_fraction=sample_fraction,
     )
+
+    if sample_fraction < 1.0:
+        log.info(
+            f"Sampling {sample_fraction:.0%} of mints "
+            f"({len(selected_features or [])} features)"
+        )
 
     optimizer = Optimizer(config)
     result = optimizer.run()
@@ -539,10 +547,20 @@ def optimize(
     validation_fraction: float = typer.Option(
         0.2, min=0.0, max=0.5, help="Fraction of latest data held out for validation"
     ),
+    sample_fraction: float = typer.Option(
+        1.0, min=0.01, max=1.0, help="Fraction of mints to keep (sub-sample whole mints)"
+    ),
 ):
     """Run Optuna optimization only."""
     init_directories()
-    _run_optuna(trials, workers, resume, bundle=bundle, validation_fraction=validation_fraction)
+    _run_optuna(
+        trials,
+        workers,
+        resume,
+        bundle=bundle,
+        validation_fraction=validation_fraction,
+        sample_fraction=sample_fraction,
+    )
 
 
 if __name__ == "__main__":

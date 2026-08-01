@@ -10,17 +10,20 @@
 # re-running after an interruption simply resumes where it left off.
 #
 # Usage:
-#   ./scripts/run_optuna_detached.sh [trials] [workers] [bundle]
+#   ./scripts/run_optuna_detached.sh [trials] [workers] [bundle] [sample_fraction]
 #
-#   trials     number of trials per invocation (default 5000)
-#   workers    worker processes (default 16)
-#   bundle     feature bundle: structure | flow | early_momentum | reduced_full
-#              (default: none, uses selected_features.json)
+#   trials            number of trials per invocation (default 5000)
+#   workers           worker processes (default 16)
+#   bundle            feature bundle: structure | flow | early_momentum | reduced_full
+#                     (default: none, uses selected_features.json)
+#   sample_fraction   fraction of mints to keep (default 1.0 = all; use e.g. 0.3
+#                     to cut runtime and RAM ~3x during ablation runs)
 #
 # Examples:
 #   ./scripts/run_optuna_detached.sh           # 5000 trials, 16 workers
 #   ./scripts/run_optuna_detached.sh 1000 16   # 1000 trials, 16 workers
 #   ./scripts/run_optuna_detached.sh 1500 16 flow   # flow bundle ablation
+#   ./scripts/run_optuna_detached.sh 300 16 flow 0.3   # cheap ablation
 #
 # Watch progress:   tail -f logs/optuna_detached.log
 # Stop it:          pkill -f hpc_replay.py  (or the tmux session name)
@@ -30,6 +33,7 @@ set -euo pipefail
 TRIALS="${1:-5000}"
 WORKERS="${2:-16}"
 BUNDLE="${3:-}"
+SAMPLE_FRACTION="${4:-1.0}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="${ROOT}/logs"
@@ -71,6 +75,7 @@ fi
 
 echo "Starting detached Optuna run (${TRIALS} trials, ${WORKERS} workers)"
 echo "  study: ${STUDY_NAME}${BUNDLE:+ (bundle: ${BUNDLE})}"
+echo "  sample_fraction: ${SAMPLE_FRACTION}"
 echo "  log: ${LOG}"
 
 BUNDLE_ARG=""
@@ -79,6 +84,6 @@ if [ -n "${BUNDLE}" ]; then
 fi
 
 tmux new-session -d -s "${SESSION}" \
-    "cd ${ROOT} && uv run python hpc_replay.py optimize --trials ${TRIALS} --workers ${WORKERS} --resume ${BUNDLE_ARG} 2>&1 | tee ${LOG}"
+    "cd ${ROOT} && uv run python hpc_replay.py optimize --trials ${TRIALS} --workers ${WORKERS} --resume --sample-fraction ${SAMPLE_FRACTION} ${BUNDLE_ARG} 2>&1 | tee ${LOG}"
 
 echo "Started. Progress: tail -f ${LOG}"

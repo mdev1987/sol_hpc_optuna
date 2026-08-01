@@ -65,6 +65,36 @@ def test_validation_fraction_clamped_to_half(tmp_path):
     assert dataset.validation_fraction == 0.5
 
 
+def test_sample_fraction_keeps_whole_mints(tmp_path):
+    n = 200
+    path = tmp_path / "features.parquet"
+    mints = [f"M{i % 10}" for i in range(n)]
+    frame = pl.DataFrame(
+        {
+            "mint": mints,
+            "timestamp": list(range(1_000, 1_000 + n)),
+            "slot": list(range(n)),
+            "price": np.linspace(1.0, 2.0, n),
+            "liquidity": np.full(n, 100.0),
+        }
+    )
+    frame.write_parquet(path)
+
+    dataset = SnapshotDataset(path, validation_fraction=0.0, sample_fraction=0.5)
+    snapshots = list(dataset.snapshots())
+    kept = {s.mint for s in snapshots}
+    assert len(kept) == 5  # ~50% of the 10 unique mints
+    # every row belongs to a kept mint (no partial-mint slicing)
+    assert all(s.mint in kept for s in snapshots)
+    assert len(snapshots) == 5 * 20  # all 20 rows of each kept mint survive
+
+
+def test_sample_fraction_full_is_unchanged(tmp_path):
+    path = _write_features(tmp_path)
+    dataset = SnapshotDataset(path, validation_fraction=0.0, sample_fraction=1.0)
+    assert len(list(dataset.snapshots())) == 100
+
+
 def test_evaluate_params_runs_both_splits(tmp_path):
     path = _write_features(tmp_path)
     dataset = SnapshotDataset(path, validation_fraction=0.2)

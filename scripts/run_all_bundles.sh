@@ -13,15 +13,22 @@
 # Usage:
 #   ./scripts/run_all_bundles.sh [trials] [workers] [bundle...]
 #
-#   trials     trials per bundle (default 1500)
+#   trials     trials per bundle (default 300; ablation budget, not the
+#              final 5000-trial run)
 #   workers    worker processes per bundle (default 16)
 #   bundle...  subset of bundles to run (default: structure flow
 #              early_momentum reduced_full)
 #
+#   Env:
+#   SAMPLE_FRACTION  fraction of mints to keep per trial (default 0.3).
+#                    Sub-samples whole mints, cutting runtime and RAM ~3x.
+#                    Set SAMPLE_FRACTION=1.0 for the full-data winner run.
+#
 # Examples:
-#   ./scripts/run_all_bundles.sh                  # 1500 trials, all 4 bundles
+#   ./scripts/run_all_bundles.sh                  # 300 trials, all 4 bundles
 #   ./scripts/run_all_bundles.sh 1000 16          # 1000 trials, all 4
 #   ./scripts/run_all_bundles.sh 1500 16 flow reduced_full
+#   SAMPLE_FRACTION=1.0 ./scripts/run_all_bundles.sh 5000 16 flow
 #
 # Watch progress:   tail -f logs/optuna_bundles.log
 # Live bar:         tmux attach -t optuna-bundles
@@ -29,8 +36,9 @@
 
 set -euo pipefail
 
-TRIALS="${1:-1500}"
+TRIALS="${1:-300}"
 WORKERS="${2:-16}"
+SAMPLE_FRACTION="${SAMPLE_FRACTION:-0.3}"
 shift 2 || true
 if [ "$#" -gt 0 ]; then
     BUNDLES=("$@")
@@ -58,7 +66,7 @@ if [ -z "${RUN_ALL_BUNDLES_INNER:-}" ]; then
     SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
     echo "Starting sequential bundle runs inside tmux session '${OUTER_SESSION}'..."
     tmux new-session -d -s "${OUTER_SESSION}" \
-        "cd ${ROOT} && RUN_ALL_BUNDLES_INNER=1 bash ${SCRIPT} ${TRIALS} ${WORKERS} ${BUNDLES[*]} 2>&1 | tee ${OUTER_LOG}"
+        "cd ${ROOT} && RUN_ALL_BUNDLES_INNER=1 SAMPLE_FRACTION=${SAMPLE_FRACTION} bash ${SCRIPT} ${TRIALS} ${WORKERS} ${BUNDLES[*]} 2>&1 | tee ${OUTER_LOG}"
     echo "Started. Watch: tail -f ${OUTER_LOG}"
     exit 0
 fi
@@ -143,7 +151,7 @@ monitor_bundle() {
 # --- Main loop --------------------------------------------------------------
 
 echo "=== Sequential bundle ablations ==="
-echo "  trials/bundle: ${TRIALS}   workers: ${WORKERS}"
+echo "  trials/bundle: ${TRIALS}   workers: ${WORKERS}   sample_fraction: ${SAMPLE_FRACTION}"
 echo "  bundles: ${BUNDLES[*]}"
 echo "  db: ${DB}"
 echo ""
@@ -167,7 +175,7 @@ for bundle in "${BUNDLES[@]}"; do
 
     # Launch only if the bundle session is not already running.
     if ! tmux has-session -t "${session}" 2>/dev/null; then
-        bash "${SCRIPT_DIR}/run_optuna_detached.sh" "${TRIALS}" "${WORKERS}" "${bundle}"
+        bash "${SCRIPT_DIR}/run_optuna_detached.sh" "${TRIALS}" "${WORKERS}" "${bundle}" "${SAMPLE_FRACTION}"
     else
         echo "[${IDX}/${TOTAL}] ${bundle}: session '${session}' already running, monitoring."
     fi

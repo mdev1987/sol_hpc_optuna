@@ -43,6 +43,7 @@ class OptunaConfig:
     seed: int = 42
     selected_features: list[str] | None = None
     validation_fraction: float = 0.0
+    sample_fraction: float = 1.0
 
 
 @dataclass(slots=True)
@@ -54,12 +55,29 @@ class OptimizationResult:
 
 
 class SnapshotDataset:
-    def __init__(self, path: Path, validation_fraction: float = 0.0):
+    def __init__(
+        self,
+        path: Path,
+        validation_fraction: float = 0.0,
+        sample_fraction: float = 1.0,
+    ):
         import polars as pl
 
         self.frame = pl.read_parquet(path)
         self.ignore = {"mint", "timestamp", "slot"}
         self.feature_columns = [c for c in self.frame.columns if c not in self.ignore]
+
+        # Sub-sample whole mints (never individual events) so per-mint price
+        # paths stay intact for the simulator's exit logic. This shrinks both
+        # per-trial runtime and the in-memory matrix, cutting VPS cost.
+        self.sample_fraction = min(max(sample_fraction, 0.0), 1.0)
+        if self.sample_fraction < 1.0:
+            import random
+
+            mints = self.frame["mint"].unique().to_list()
+            keep_n = max(1, round(len(mints) * self.sample_fraction))
+            kept = set(random.Random(42).sample(mints, keep_n))
+            self.frame = self.frame.filter(pl.col("mint").is_in(kept))
         self._mints = self.frame["mint"].to_list()
         self._timestamps = self.frame["timestamp"].to_numpy()
         self._slots = self.frame["slot"].to_numpy()
@@ -314,7 +332,9 @@ class Optimizer:
     def __init__(self, config: OptunaConfig):
         self.config = config
         self.dataset = SnapshotDataset(
-            config.dataset, validation_fraction=config.validation_fraction
+            config.dataset,
+            validation_fraction=config.validation_fraction,
+            sample_fraction=config.sample_fraction,
         )
 
     def _storage(self) -> optuna.storages.RDBStorage:
