@@ -309,18 +309,32 @@ class Optimizer:
 
         started = time.time()
         try:
-            while any(w.is_alive() for w in workers):
+            while True:
+                alive = [w for w in workers if w.is_alive()]
+                if not alive:
+                    break
                 time.sleep(10)
                 done = self._count_complete()
                 elapsed = time.time() - started
                 rate = done / elapsed if elapsed > 0 else 0
                 print(
                     f"  [bold cyan]{done}/{self.config.trials}[/] trials "
-                    f"[green]({rate:.1f}/s, ~{(self.config.trials - done) / max(rate, 1e-9):.0f}s left)[/]"
+                    f"[green]({rate:.1f}/s, ~{(self.config.trials - done) / max(rate, 1e-9):.0f}s left)[/]",
+                    flush=True,
                 )
         finally:
             for w in workers:
                 w.join()
+
+        # Surface any workers that died before finishing (e.g. OOM), so a
+        # silently-emptied pool is not mistaken for completion.
+        dead = [w for w in workers if w.exitcode and w.exitcode != 0]
+        if dead:
+            raise RuntimeError(
+                f"{len(dead)}/{len(workers)} optuna workers exited with "
+                f"code(s): {[w.exitcode for w in dead]}. Trials completed: "
+                f"{self._num_complete()}."
+            )
 
         if self._num_complete() == 0:
             raise RuntimeError("Parallel optimization produced no complete trials.")
