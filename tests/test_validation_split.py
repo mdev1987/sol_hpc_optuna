@@ -4,7 +4,16 @@ import numpy as np
 import polars as pl
 import pytest
 
-from optuna_engine import PF_CAP, ROI_CAP, SnapshotDataset, evaluate_params, score_simulation, _strategy_from_params
+from optuna_engine import (
+    MIN_TRAIN_TRADES,
+    PF_CAP,
+    ROI_CAP,
+    SnapshotDataset,
+    evaluate_params,
+    score_simulation,
+    _min_trades_for,
+    _strategy_from_params,
+)
 from simulator import ExitReason, SimulationResult, Simulator, Trade, WeightedStrategy
 
 
@@ -204,3 +213,26 @@ def test_score_simulation_caps_avg_roi():
     assert metrics["avg_roi"] == ROI_CAP
     assert score == pytest.approx(2.5 * PF_CAP + 1.5 * 1.0 + 2.0 * ROI_CAP)
     assert abs(score) < 30
+
+
+def test_validation_floor_is_proportional(tmp_path):
+    path = _write_features(tmp_path, n=100)
+    dataset = SnapshotDataset(path, validation_fraction=0.2)
+    n_train = int(dataset._train_mask.sum())
+    n_val = int(dataset._val_mask.sum())
+
+    assert _min_trades_for(dataset, on_validation=False) == MIN_TRAIN_TRADES
+    expected_val = max(1, round(MIN_TRAIN_TRADES * n_val / n_train))
+    assert _min_trades_for(dataset, on_validation=True) == expected_val
+    assert expected_val < MIN_TRAIN_TRADES  # holdout is smaller than training
+
+
+def test_evaluate_params_floor_blocks_low_trade_config(tmp_path):
+    path = _write_features(tmp_path)  # single mint, ~3 trades: below the floor
+    dataset = SnapshotDataset(path, validation_fraction=0.0)
+    params = {"w_price": 1.0, "minimum_score": -5.0}
+
+    score, metrics = evaluate_params(params, dataset, ["price"], on_validation=False)
+
+    assert score == -1e9
+    assert metrics["trades"] < MIN_TRAIN_TRADES

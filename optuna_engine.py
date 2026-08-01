@@ -286,7 +286,7 @@ def _compute_score(sim_config: "SimulatorConfig", strategy_config: "StrategyConf
         dataset.snapshot_at,
     )
 
-    if result.trades < 20:
+    if result.trades < MIN_TRAIN_TRADES:
         return -1e9, {
             "profit_factor": 0.0,
             "win_rate": 0.0,
@@ -359,7 +359,7 @@ class Objective:
         else:
             simulator = Simulator(sim_config, WeightedStrategy(strategy_config))
             result = simulator.run(self.dataset.snapshots())
-            if result.trades < 20:
+            if result.trades < MIN_TRAIN_TRADES:
                 return -1e9
             score, metrics = score_simulation(result)
 
@@ -383,6 +383,25 @@ PF_CAP = 5.0
 # extreme manual closes on noisy data can't inflate the score beyond the
 # intended bounded range.
 ROI_CAP = 3.0
+# Minimum closed trades a parameter set must produce to be scored at all.
+# The capped objective doesn't reward trade count, so a narrow config with a
+# handful of high-ROI train trades can top the score by overfitting the train
+# window and then fail on the (smaller) validation holdout. Requiring enough
+# trades pushes the search toward strategies that generalize.
+MIN_TRAIN_TRADES = 150
+
+
+def _min_trades_for(dataset, on_validation: bool) -> int:
+    """Trade floor for a split: the train floor, or one scaled proportionally
+    to the holdout size so a healthy strategy isn't discarded just because the
+    validation window is smaller than the training window."""
+    if not on_validation:
+        return MIN_TRAIN_TRADES
+    n_train = int(dataset._train_mask.sum())
+    n_val = int(dataset._val_mask.sum())
+    if n_train <= 0:
+        return MIN_TRAIN_TRADES
+    return max(1, round(MIN_TRAIN_TRADES * n_val / n_train))
 
 
 def score_simulation(result) -> tuple[float, dict]:
@@ -477,7 +496,7 @@ def evaluate_params(
     simulator = Simulator(simulator_config, WeightedStrategy(strategy_config))
     snapshots = dataset.validation_snapshots() if on_validation else dataset.snapshots()
     result = simulator.run(snapshots)
-    if result.trades < 20:
+    if result.trades < _min_trades_for(dataset, on_validation):
         return -1e9, {
             "profit_factor": 0.0,
             "win_rate": 0.0,
