@@ -411,15 +411,45 @@ def _select_features() -> None:
     )
 
     log.info(f"Selected {len(result.features)} features: {result.features}")
+    log.info(f"Selection bound by: {result.cap_reason}")
 
 
-def _run_optuna(trials: int, workers: int, resume: bool) -> None:
+def _run_optuna(
+    trials: int,
+    workers: int,
+    resume: bool,
+    bundle: str | None = None,
+    validation_fraction: float = 0.2,
+) -> None:
     from optuna_engine import Optimizer, OptunaConfig
 
     features_path = CACHE_DIR / "selected_features.json"
     selected_features: list[str] | None = None
     if features_path.exists():
         selected_features = json.loads(features_path.read_text())
+
+    study_name = "replay_optuna"
+    if bundle:
+        from feature_bundles import ALLOWED_BUNDLES, BUNDLES
+
+        if bundle not in ALLOWED_BUNDLES:
+            log.error(
+                f"Unknown bundle '{bundle}'. Choose from: {', '.join(ALLOWED_BUNDLES)}"
+            )
+            sys.exit(1)
+        if bundle == "reduced_full":
+            if not selected_features:
+                log.error("Bundle 'reduced_full' requires selected_features.json.")
+                sys.exit(1)
+            bundle_features = list(selected_features)
+        else:
+            bundle_features = list(BUNDLES[bundle])
+        selected_features = bundle_features
+        study_name = f"replay_optuna_{bundle}"
+        log.info(
+            f"Bundle '{bundle}': searching {len(bundle_features)} features "
+            f"({study_name})"
+        )
 
     dataset_path = CACHE_DIR / "features.parquet"
     if not dataset_path.exists():
@@ -429,12 +459,13 @@ def _run_optuna(trials: int, workers: int, resume: bool) -> None:
     config = OptunaConfig(
         dataset=dataset_path,
         output_dir=REPORT_DIR,
-        study_name="replay_optuna",
+        study_name=study_name,
         storage=f"sqlite:///{OPTUNA_DB}",
         trials=trials,
         jobs=workers,
         seed=CONFIG.random_seed,
         selected_features=selected_features,
+        validation_fraction=validation_fraction,
     )
 
     optimizer = Optimizer(config)
@@ -445,6 +476,13 @@ def _run_optuna(trials: int, workers: int, resume: bool) -> None:
     log.info(f"Win rate: {result.metrics['win_rate']:.2%}")
     log.info(f"Max drawdown: {result.metrics['drawdown']:.2%}")
     log.info(f"Trades: {result.metrics['trades']}")
+    if "val_score" in result.metrics:
+        log.info(
+            f"Validation: score {result.metrics['val_score']:.4f}, "
+            f"PF {result.metrics['val_profit_factor']:.2f}, "
+            f"win rate {result.metrics['val_win_rate']:.2%}, "
+            f"trades {result.metrics['val_trades']}"
+        )
 
 
 @app.command()
@@ -494,10 +532,17 @@ def optimize(
     trials: int = CONFIG.trials,
     workers: int = CPU_WORKERS,
     resume: bool = False,
+    bundle: str | None = typer.Option(
+        None,
+        help="Feature bundle: structure | flow | early_momentum | reduced_full",
+    ),
+    validation_fraction: float = typer.Option(
+        0.2, min=0.0, max=0.5, help="Fraction of latest data held out for validation"
+    ),
 ):
     """Run Optuna optimization only."""
     init_directories()
-    _run_optuna(trials, workers, resume)
+    _run_optuna(trials, workers, resume, bundle=bundle, validation_fraction=validation_fraction)
 
 
 if __name__ == "__main__":

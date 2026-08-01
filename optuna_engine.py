@@ -42,6 +42,7 @@ class OptunaConfig:
     jobs: int = -1
     seed: int = 42
     selected_features: list[str] | None = None
+    validation_fraction: float = 0.0
 
 
 @dataclass(slots=True)
@@ -53,7 +54,7 @@ class OptimizationResult:
 
 
 class SnapshotDataset:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, validation_fraction: float = 0.0):
         import polars as pl
 
         self.frame = pl.read_parquet(path)
@@ -65,15 +66,26 @@ class SnapshotDataset:
         features_frame = self.frame.select(self.feature_columns)
         self._features = np.nan_to_num(features_frame.to_numpy(), nan=0.0, posinf=0.0, neginf=0.0)
 
-        means = self._features.mean(axis=0)
-        stds = self._features.std(axis=0)
+        n = len(self._timestamps)
+        self.validation_fraction = min(max(validation_fraction, 0.0), 0.5)
+        self._train_mask = np.ones(n, dtype=bool)
+        self._val_mask = np.zeros(n, dtype=bool)
+        if self.validation_fraction > 0.0:
+            cutoff = np.quantile(np.sort(self._timestamps), 1.0 - self.validation_fraction)
+            self._val_mask = self._timestamps > cutoff
+            self._train_mask = ~self._val_mask
+
+        train_features = self._features[self._train_mask]
+        means = train_features.mean(axis=0)
+        stds = train_features.std(axis=0)
         self.scaler = {
             col: (float(means[j]), float(stds[j]))
             for j, col in enumerate(self.feature_columns)
         }
 
-    def snapshots(self):
-        for i in range(len(self._features)):
+    def _iter(self, mask: np.ndarray):
+        indexes = np.flatnonzero(mask)
+        for i in indexes:
             yield FeatureSnapshot(
                 mint=self._mints[i],
                 timestamp=int(self._timestamps[i]),
@@ -83,6 +95,12 @@ class SnapshotDataset:
                     for j, feature in enumerate(self.feature_columns)
                 },
             )
+
+    def snapshots(self):
+        yield from self._iter(self._train_mask)
+
+    def validation_snapshots(self):
+        yield from self._iter(self._val_mask)
 
 
 class Objective:
@@ -137,26 +155,103 @@ class Objective:
         if result.trades < 20:
             return -1e9
 
-        profit_factor = _finite(result.profit_factor)
-        win_rate = _finite(result.win_rate)
-        total_return = _finite(result.total_return)
-        total_pnl = _finite(result.total_pnl)
-        max_drawdown = _finite(result.max_drawdown)
+        score, metrics = score_simulation(result)
 
-        score = (
-            2.5 * profit_factor
-            + 1.5 * win_rate
-            + 1.0 * total_return
-            + 0.5 * total_pnl
-            - 3.0 * max_drawdown
-        )
-
-        trial.set_user_attr("profit_factor", profit_factor)
-        trial.set_user_attr("win_rate", win_rate)
-        trial.set_user_attr("drawdown", max_drawdown)
+        trial.set_user_attr("profit_factor", metrics["profit_factor"])
+        trial.set_user_attr("win_rate", metrics["win_rate"])
+        trial.set_user_attr("drawdown", metrics["drawdown"])
         trial.set_user_attr("trades", int(result.trades))
 
         return score
+
+
+def score_simulation(result) -> tuple[float, dict]:
+    """Compute the objective score and core metrics from a simulation result."""
+    profit_factor = _finite(result.profit_factor)
+    win_rate = _finite(result.win_rate)
+    total_return = _finite(result.total_return)
+    total_pnl = _finite(result.total_pnl)
+    max_drawdown = _finite(result.max_drawdown)
+
+    score = (
+        2.5 * profit_factor
+        + 1.5 * win_rate
+        + 1.0 * total_return
+        + 0.5 * total_pnl
+        - 3.0 * max_drawdown
+    )
+    metrics = {
+        "profit_factor": profit_factor,
+        "win_rate": win_rate,
+        "drawdown": max_drawdown,
+        "trades": int(result.trades),
+    }
+    return score, metrics
+
+
+def _strategy_from_params(
+    params: dict,
+    selected_features: list[str],
+    scaler: dict,
+    validation_fraction: float = 0.0,
+) -> tuple[StrategyConfig, SimulatorConfig]:
+    weights: dict[str, float] = {}
+    for feature in selected_features or []:
+        weight = params.get(f"w_{feature}")
+        if weight is not None:
+            weights[feature] = float(weight)
+
+    min_liquidity = float(params.get("min_liquidity", 1.0))
+    min_market_cap = float(params.get("min_market_cap", 10.0))
+    strategy_config = StrategyConfig(
+        min_price_change_5=params.get("min_price_change_5"),
+        min_price_change_20=params.get("min_price_change_20"),
+        min_liquidity=min_liquidity,
+        max_liquidity=params.get("max_liquidity", 50_000.0),
+        min_market_cap=min_market_cap,
+        max_market_cap=params.get("max_market_cap", 200_000.0),
+        min_volume=params.get("min_volume"),
+        min_buy_ratio=params.get("min_buy_ratio"),
+        min_trades=params.get("min_trades"),
+        min_wallets=params.get("min_wallets"),
+        min_wallet_velocity=params.get("min_wallet_velocity"),
+        minimum_score=float(params.get("minimum_score", 0.0)),
+        weights=weights,
+        scaler=scaler,
+    )
+    simulator_config = SimulatorConfig(
+        position_size=float(params.get("position_size", 0.20)),
+        stop_loss=float(params.get("stop_loss", 0.15)),
+        take_profit=float(params.get("take_profit", 1.0)),
+        trailing_trigger=float(params.get("trailing_trigger", 0.30)),
+        trailing_stop=float(params.get("trailing_stop", 0.20)),
+        ttl_seconds=int(params.get("ttl_seconds", 300)),
+        max_positions=int(params.get("max_positions", 3)),
+    )
+    return strategy_config, simulator_config
+
+
+def evaluate_params(
+    params: dict,
+    dataset: SnapshotDataset,
+    selected_features: list[str],
+    on_validation: bool = False,
+) -> tuple[float, dict]:
+    """Run a parameter set through the simulator, scoring train or held-out data."""
+    strategy_config, simulator_config = _strategy_from_params(
+        params, selected_features, dataset.scaler
+    )
+    simulator = Simulator(simulator_config, WeightedStrategy(strategy_config))
+    snapshots = dataset.validation_snapshots() if on_validation else dataset.snapshots()
+    result = simulator.run(snapshots)
+    if result.trades < 20:
+        return -1e9, {
+            "profit_factor": 0.0,
+            "win_rate": 0.0,
+            "drawdown": 0.0,
+            "trades": int(result.trades),
+        }
+    return score_simulation(result)
 
 def _is_transient_storage_error(exc: Exception) -> bool:
     """Storage failures worth retrying: SQLite lock/commit errors and the
@@ -218,7 +313,9 @@ def _worker_main(config: OptunaConfig, trials: int, seed: int) -> None:
 class Optimizer:
     def __init__(self, config: OptunaConfig):
         self.config = config
-        self.dataset = SnapshotDataset(config.dataset)
+        self.dataset = SnapshotDataset(
+            config.dataset, validation_fraction=config.validation_fraction
+        )
 
     def _storage(self) -> optuna.storages.RDBStorage:
         from optuna.storages import RDBStorage
@@ -340,7 +437,7 @@ class Optimizer:
             raise RuntimeError("Parallel optimization produced no complete trials.")
 
     def _count_complete(self) -> int:
-        """Count COMPLETE trials via a direct SQL query (lightweight)."""
+        """Count COMPLETE trials for this study via a direct SQL query (lightweight)."""
         if not self.config.storage.startswith("sqlite:///"):
             return self._num_complete()
         import sqlite3
@@ -349,7 +446,10 @@ class Optimizer:
         try:
             with sqlite3.connect(db_path, timeout=60) as con:
                 row = con.execute(
-                    "SELECT COUNT(*) FROM trials WHERE state = 'COMPLETE'"
+                    "SELECT COUNT(*) FROM trials t "
+                    "JOIN studies s ON t.study_id = s.study_id "
+                    "WHERE s.study_name = ? AND t.state = 'COMPLETE'",
+                    (self.config.study_name,),
                 ).fetchone()
             return int(row[0]) if row else 0
         except sqlite3.Error:
@@ -368,16 +468,28 @@ class Optimizer:
             self._run_sequential(objective)
 
         best = self.study().best_trial
+        metrics = {
+            "profit_factor": best.user_attrs.get("profit_factor"),
+            "win_rate": best.user_attrs.get("win_rate"),
+            "drawdown": best.user_attrs.get("drawdown"),
+            "trades": best.user_attrs.get("trades"),
+        }
+
+        if self.dataset.validation_fraction > 0.0:
+            val_score, val_metrics = evaluate_params(
+                dict(best.params),
+                self.dataset,
+                self.config.selected_features or [],
+                on_validation=True,
+            )
+            metrics["val_score"] = val_score
+            metrics.update({f"val_{k}": v for k, v in val_metrics.items()})
+
         result = OptimizationResult(
             score=best.value,
             trial=best.number,
             parameters=dict(best.params),
-            metrics={
-                "profit_factor": best.user_attrs.get("profit_factor"),
-                "win_rate": best.user_attrs.get("win_rate"),
-                "drawdown": best.user_attrs.get("drawdown"),
-                "trades": best.user_attrs.get("trades"),
-            },
+            metrics=metrics,
         )
         self.save(result)
         return result
@@ -390,7 +502,12 @@ class Optimizer:
             "parameters": result.parameters,
             "metrics": result.metrics,
         }
-        path = self.config.output_dir / "best_strategy.json"
+        name = self.config.study_name
+        suffix = ""
+        if name and name.startswith("replay_optuna_") and name != "replay_optuna":
+            bundle = name.removeprefix("replay_optuna_")
+            suffix = f"_{bundle}"
+        path = self.config.output_dir / f"best_strategy{suffix}.json"
         path.write_text(json.dumps(output, indent=4))
 
 
