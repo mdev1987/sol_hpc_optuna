@@ -218,8 +218,9 @@ class RiskManager:
     def __init__(self, config: SimulatorConfig):
         self.config = config
 
-    def should_exit(self, position: Position, snapshot: FeatureSnapshot) -> ExitReason | None:
-        price = snapshot.features["price"]
+    def should_exit(
+        self, position: Position, price: float, timestamp: int
+    ) -> ExitReason | None:
 
         if price > position.highest_price:
             position.highest_price = price
@@ -240,7 +241,7 @@ class RiskManager:
         if price <= position.stop_price:
             return ExitReason.STOP_LOSS
 
-        age = snapshot.timestamp - position.entry_time
+        age = timestamp - position.entry_time
         if age >= self.config.ttl_seconds:
             return ExitReason.TTL
 
@@ -315,7 +316,7 @@ class Simulator:
             if mint != snapshot.mint:
                 continue
             position = self.portfolio.positions[mint]
-            reason = self.risk.should_exit(position, snapshot)
+            reason = self.risk.should_exit(position, snapshot.features["price"], snapshot.timestamp)
             if reason is None:
                 continue
             self.portfolio.close_position(mint, snapshot.features["price"], snapshot.timestamp, reason)
@@ -326,6 +327,10 @@ class Simulator:
         if not self.strategy.should_enter(snapshot):
             return
         self.portfolio.open_position(snapshot)
+
+    def _update_row(self, snapshot: FeatureSnapshot) -> None:
+        self._update_positions(snapshot)
+        self._update_entries(snapshot)
 
     @staticmethod
     def _safe(value: float, fallback: float = 0.0) -> float:
@@ -361,14 +366,59 @@ class Simulator:
         )
 
     def run(self, snapshots: Iterable[FeatureSnapshot]) -> SimulationResult:
+        """Sequential simulation over ``FeatureSnapshot`` rows (reference path)."""
         last_price: dict[str, float] = {}
         last_time: dict[str, int] = {}
         for snapshot in snapshots:
             last_price[snapshot.mint] = snapshot.features["price"]
             last_time[snapshot.mint] = snapshot.timestamp
-            self._update_positions(snapshot)
-            self._update_entries(snapshot)
+            self._update_row(snapshot)
 
+        return self._close_all(last_price, last_time)
+
+    def run_indexed(
+        self,
+        indices,
+        mints: list[str],
+        timestamps,
+        prices,
+        eligible,
+        make_snapshot,
+    ) -> SimulationResult:
+        """Array-backed simulation with a precomputed entry-eligibility mask.
+
+        The exit logic is identical to ``run`` (sequential, per open position).
+        The only difference: ``should_enter`` is evaluated only on rows where
+        ``eligible`` is True, so the expensive per-snapshot feature score is
+        skipped for the ~99.9% of rows that are rejected anyway.
+
+        ``indices`` are the row positions to replay (e.g. the train rows).
+        ``make_snapshot(i)`` builds a ``FeatureSnapshot`` for the (few) eligible
+        rows; exits read price/timestamp directly from the arrays.
+        """
+        last_price: dict[str, float] = {}
+        last_time: dict[str, int] = {}
+        for i in indices:
+            mint = mints[i]
+            price = prices[i]
+            timestamp = int(timestamps[i])
+            last_price[mint] = price
+            last_time[mint] = timestamp
+            if self.portfolio.positions:
+                for m in list(self.portfolio.positions.keys()):
+                    if m != mint:
+                        continue
+                    position = self.portfolio.positions[m]
+                    reason = self.risk.should_exit(position, price, timestamp)
+                    if reason is None:
+                        continue
+                    self.portfolio.close_position(mint, price, timestamp, reason)
+            if eligible[i]:
+                self._update_entries(make_snapshot(i))
+
+        return self._close_all(last_price, last_time)
+
+    def _close_all(self, last_price: dict, last_time: dict) -> SimulationResult:
         for mint in list(self.portfolio.positions.keys()):
             position = self.portfolio.positions[mint]
             price = last_price.get(mint, position.entry_price)

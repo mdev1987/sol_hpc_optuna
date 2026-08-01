@@ -54,12 +54,34 @@ class OptimizationResult:
     metrics: dict
 
 
+# Feature columns `should_enter` thresholds on (plus `price`, used by exits).
+# Kept in the reduced working matrix even when not part of `selected_features`,
+# so per-row eligibility is a strict subset of these.
+_THRESHOLD_COLUMNS = {
+    "price",
+    "price_change_5",
+    "price_change_20",
+    "price_change_50",
+    "liquidity",
+    "market_cap",
+    "volume",
+    "buy_ratio",
+    "trades",
+    "unique_wallets",
+    "wallet_velocity",
+    "price_velocity",
+    "volume_velocity",
+    "liquidity_velocity",
+}
+
+
 class SnapshotDataset:
     def __init__(
         self,
         path: Path,
         validation_fraction: float = 0.0,
         sample_fraction: float = 1.0,
+        columns: list[str] | None = None,
     ):
         import polars as pl
 
@@ -81,8 +103,6 @@ class SnapshotDataset:
         self._mints = self.frame["mint"].to_list()
         self._timestamps = self.frame["timestamp"].to_numpy()
         self._slots = self.frame["slot"].to_numpy()
-        features_frame = self.frame.select(self.feature_columns)
-        self._features = np.nan_to_num(features_frame.to_numpy(), nan=0.0, posinf=0.0, neginf=0.0)
 
         n = len(self._timestamps)
         self.validation_fraction = min(max(validation_fraction, 0.0), 0.5)
@@ -93,7 +113,21 @@ class SnapshotDataset:
             self._val_mask = self._timestamps > cutoff
             self._train_mask = ~self._val_mask
 
-        train_features = self._features[self._train_mask]
+        # Working column set: everything `should_enter` reads plus the weighted
+        # bundle features. Shrinks the per-row FeatureSnapshot dict (the
+        # ~4.9s/1M cost) without changing any evaluated feature.
+        if columns is None:
+            self.work_columns = list(self.feature_columns)
+        else:
+            wanted = set(columns) | _THRESHOLD_COLUMNS
+            self.work_columns = [c for c in self.feature_columns if c in wanted]
+        self._work_index = {c: j for j, c in enumerate(self.work_columns)}
+
+        features_frame = self.frame.select(self.feature_columns)
+        full = np.nan_to_num(features_frame.to_numpy(), nan=0.0, posinf=0.0, neginf=0.0)
+        full = full.astype(np.float64)
+
+        train_features = full[self._train_mask]
         means = train_features.mean(axis=0)
         stds = train_features.std(axis=0)
         self.scaler = {
@@ -101,18 +135,51 @@ class SnapshotDataset:
             for j, col in enumerate(self.feature_columns)
         }
 
+        # Reduced raw matrix + standardized matrix over working columns.
+        work_idx = [self.feature_columns.index(c) for c in self.work_columns]
+        self._work = full[:, work_idx].copy()
+        del full
+
+        work_means = np.array([means[j] for j in work_idx])
+        work_stds = np.array([stds[j] for j in work_idx])
+        self._z = np.zeros_like(self._work)
+        safe = work_stds > 0
+        self._z[:, safe] = (self._work[:, safe] - work_means[safe]) / work_stds[safe]
+
+        self._prices = self._work[:, self._work_index["price"]]
+
+        # Numeric mint ids, used to build the "rows to visit" mask cheaply.
+        self._mint_ids = np.array(
+            [self._mint_code(m) for m in self._mints], dtype=np.int64
+        )
+
+    _mint_codes: dict[str, int] | None = None
+
+    @classmethod
+    def _mint_code(cls, mint: str) -> int:
+        if cls._mint_codes is None:
+            cls._mint_codes = {}
+        code = cls._mint_codes.get(mint)
+        if code is None:
+            code = len(cls._mint_codes)
+            cls._mint_codes[mint] = code
+        return code
+
     def _iter(self, mask: np.ndarray):
         indexes = np.flatnonzero(mask)
         for i in indexes:
-            yield FeatureSnapshot(
-                mint=self._mints[i],
-                timestamp=int(self._timestamps[i]),
-                slot=int(self._slots[i]),
-                features={
-                    feature: float(self._features[i, j])
-                    for j, feature in enumerate(self.feature_columns)
-                },
-            )
+            yield self.snapshot_at(i)
+
+    def snapshot_at(self, i: int) -> FeatureSnapshot:
+        return FeatureSnapshot(
+            mint=self._mints[i],
+            timestamp=int(self._timestamps[i]),
+            slot=int(self._slots[i]),
+            features={
+                feature: float(self._work[i, j])
+                for j, feature in enumerate(self.work_columns)
+            },
+        )
 
     def snapshots(self):
         yield from self._iter(self._train_mask)
@@ -121,17 +188,103 @@ class SnapshotDataset:
         yield from self._iter(self._val_mask)
 
 
+def _compute_eligible(dataset, strategy_config) -> np.ndarray:
+    """Vectorized equivalent of ``WeightedStrategy.should_enter``.
+
+    Returns a boolean array (one entry per dataset row). Thresholds compare the
+    *raw* working columns (exactly what ``should_enter`` sees), and the weighted
+    score uses the standardized matrix ``dataset._z`` with the same scaler
+    semantics as ``WeightedStrategy.score``.
+    """
+    cfg = strategy_config
+    n = len(dataset._timestamps)
+    widx = dataset._work_index
+    work = dataset._work
+    z = dataset._z
+
+    # Score vector: (Σ w_i · z_i) / Σ|w_i|, matching WeightedStrategy.score.
+    weights = cfg.weights or {}
+    if weights:
+        total = sum(abs(w) for w in weights.values())
+        if total > 0:
+            cols = []
+            wv = []
+            for feature, weight in weights.items():
+                j = widx.get(feature)
+                if j is not None:
+                    cols.append(j)
+                    wv.append(weight)
+            if cols:
+                score_vec = (z[:, cols] @ np.array(wv)) / total
+            else:
+                score_vec = np.zeros(n)
+        else:
+            score_vec = np.zeros(n)
+    else:
+        score_vec = np.zeros(n)
+    eligible = score_vec >= cfg.minimum_score
+
+    def col(name: str) -> np.ndarray:
+        j = widx.get(name)
+        return work[:, j] if j is not None else np.zeros(n)
+
+    # Thresholds on raw values, mirroring should_enter's check list.
+    if cfg.min_price_change_5 is not None:
+        eligible &= col("price_change_5") >= cfg.min_price_change_5
+    if cfg.min_price_change_20 is not None:
+        eligible &= col("price_change_20") >= cfg.min_price_change_20
+    if cfg.min_price_change_50 is not None:
+        eligible &= col("price_change_50") >= cfg.min_price_change_50
+    if cfg.min_liquidity is not None:
+        eligible &= col("liquidity") >= cfg.min_liquidity
+    if cfg.max_liquidity is not None:
+        eligible &= col("liquidity") <= cfg.max_liquidity
+    if cfg.min_market_cap is not None:
+        eligible &= col("market_cap") >= cfg.min_market_cap
+    if cfg.max_market_cap is not None:
+        eligible &= col("market_cap") <= cfg.max_market_cap
+    if cfg.min_volume is not None:
+        eligible &= col("volume") >= cfg.min_volume
+    if cfg.min_buy_ratio is not None:
+        eligible &= col("buy_ratio") >= cfg.min_buy_ratio
+    if cfg.min_trades is not None:
+        eligible &= col("trades") >= cfg.min_trades
+    if cfg.min_wallets is not None:
+        eligible &= col("unique_wallets") >= cfg.min_wallets
+    if cfg.min_wallet_velocity is not None:
+        eligible &= col("wallet_velocity") >= cfg.min_wallet_velocity
+    if cfg.min_price_velocity is not None:
+        eligible &= col("price_velocity") >= cfg.min_price_velocity
+    if cfg.min_volume_velocity is not None:
+        eligible &= col("volume_velocity") >= cfg.min_volume_velocity
+    if cfg.min_liquidity_velocity is not None:
+        eligible &= col("liquidity_velocity") >= cfg.min_liquidity_velocity
+
+    return eligible
+
+
 def _compute_score(sim_config: "SimulatorConfig", strategy_config: "StrategyConfig") -> tuple[float, dict]:
     """Worker-side entry point for the compute pool: run the simulator.
 
     Uses the module-level ``_DATASET`` (inherited via fork copy-on-write),
-    so the ~8GB feature matrix stays shared instead of duplicated per worker.
+    so the feature matrix stays shared instead of duplicated per worker.
+    Entries are gated by a vectorized eligibility mask (``_compute_eligible``);
+    exits remain sequential on the array-backed row walk.
     """
     global _DATASET
     assert _DATASET is not None, "worker called before parent set _DATASET"
+    dataset = _DATASET
 
+    eligible = _compute_eligible(dataset, strategy_config)
     simulator = Simulator(sim_config, WeightedStrategy(strategy_config))
-    result = simulator.run(_DATASET.snapshots())
+    result = simulator.run_indexed(
+        np.flatnonzero(dataset._train_mask),
+        dataset._mints,
+        dataset._timestamps,
+        dataset._prices,
+        eligible,
+        dataset.snapshot_at,
+    )
 
     if result.trades < 20:
         return -1e9, {
@@ -166,7 +319,7 @@ class Objective:
             max_liquidity=trial.suggest_float("max_liquidity", min_liquidity, 50_000),
             min_market_cap=min_market_cap,
             max_market_cap=trial.suggest_float("max_market_cap", min_market_cap, 200_000),
-            min_volume=trial.suggest_float("min_volume", 0.5, 200),
+            min_volume=trial.suggest_float("min_volume", 1.0, 50),
             min_buy_ratio=trial.suggest_float("min_buy_ratio", 0.10, 0.95),
             min_trades=trial.suggest_int("min_trades", 1, 500),
             min_wallets=trial.suggest_int("min_wallets", 1, 300),
@@ -178,13 +331,13 @@ class Objective:
 
     def _simulator_config(self, trial: optuna.Trial) -> SimulatorConfig:
         return SimulatorConfig(
-            position_size=trial.suggest_float("position_size", 0.05, 1.0),
-            stop_loss=trial.suggest_float("stop_loss", 0.03, 0.60),
-            take_profit=trial.suggest_float("take_profit", 0.10, 5.00),
+            position_size=trial.suggest_float("position_size", 0.10, 0.50),
+            stop_loss=trial.suggest_float("stop_loss", 0.08, 0.25),
+            take_profit=trial.suggest_float("take_profit", 0.50, 3.00),
             trailing_trigger=trial.suggest_float("trailing_trigger", 0.05, 2.00),
             trailing_stop=trial.suggest_float("trailing_stop", 0.02, 0.80),
-            ttl_seconds=trial.suggest_int("ttl_seconds", 5, 600),
-            max_positions=trial.suggest_int("max_positions", 1, 10),
+            ttl_seconds=trial.suggest_int("ttl_seconds", 60, 600),
+            max_positions=trial.suggest_int("max_positions", 1, 5),
         )
 
     def _simulator(self, trial: optuna.Trial) -> Simulator:
@@ -222,19 +375,34 @@ class Objective:
         return self._evaluate(trial, sim_config, strategy_config)
 
 
+# Profit factor is capped before scoring so near-zero gross losses can't
+# dominate the objective with absurd PF spikes; a stable strategy with PF 5
+# already represents a strong edge.
+PF_CAP = 5.0
+# Per-trade average ROI is capped too (≈300% avg return per trade), so a few
+# extreme manual closes on noisy data can't inflate the score beyond the
+# intended bounded range.
+ROI_CAP = 3.0
+
+
 def score_simulation(result) -> tuple[float, dict]:
-    """Compute the objective score and core metrics from a simulation result."""
-    profit_factor = _finite(result.profit_factor)
+    """Compute the objective score and core metrics from a simulation result.
+
+    The score uses bounded terms only: profit factor (capped at ``PF_CAP``),
+    win rate, per-trade average ROI (independent of balance compounding), and
+    max drawdown. Raw ``total_return``/``total_pnl`` are deliberately excluded
+    because they explode with position sizing, rewarding leverage instead of
+    edge.
+    """
+    profit_factor = min(_finite(result.profit_factor), PF_CAP)
     win_rate = _finite(result.win_rate)
-    total_return = _finite(result.total_return)
-    total_pnl = _finite(result.total_pnl)
     max_drawdown = _finite(result.max_drawdown)
+    avg_roi = min(_avg_trade_roi(result.closed_trades), ROI_CAP)
 
     score = (
         2.5 * profit_factor
         + 1.5 * win_rate
-        + 1.0 * total_return
-        + 0.5 * total_pnl
+        + 2.0 * avg_roi
         - 3.0 * max_drawdown
     )
     metrics = {
@@ -242,8 +410,16 @@ def score_simulation(result) -> tuple[float, dict]:
         "win_rate": win_rate,
         "drawdown": max_drawdown,
         "trades": int(result.trades),
+        "avg_roi": avg_roi,
     }
     return score, metrics
+
+
+def _avg_trade_roi(trades) -> float:
+    """Mean per-trade ROI (fraction of invested capital), 0.0 if no trades."""
+    if not trades:
+        return 0.0
+    return sum(_finite(t.roi) for t in trades) / len(trades)
 
 
 def _strategy_from_params(
@@ -331,6 +507,7 @@ class Optimizer:
             config.dataset,
             validation_fraction=config.validation_fraction,
             sample_fraction=config.sample_fraction,
+            columns=config.selected_features,
         )
 
     def _storage(self) -> optuna.storages.RDBStorage:

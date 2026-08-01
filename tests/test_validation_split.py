@@ -4,8 +4,42 @@ import numpy as np
 import polars as pl
 import pytest
 
-from optuna_engine import SnapshotDataset, evaluate_params, score_simulation, _strategy_from_params
-from simulator import Simulator, WeightedStrategy
+from optuna_engine import PF_CAP, ROI_CAP, SnapshotDataset, evaluate_params, score_simulation, _strategy_from_params
+from simulator import ExitReason, SimulationResult, Simulator, Trade, WeightedStrategy
+
+
+def _result_with_trades(rois, profit_factor, total_return=0.0, total_pnl=0.0, max_drawdown=0.0):
+    trades = [
+        Trade(
+            mint=f"M{i}",
+            entry_time=0,
+            exit_time=1,
+            entry_price=1.0,
+            exit_price=1.0 + roi,
+            quantity=1.0,
+            invested=1.0,
+            received=1.0 + roi,
+            pnl=roi,
+            roi=roi,
+            reason=ExitReason.TAKE_PROFIT,
+        )
+        for i, roi in enumerate(rois)
+    ]
+    return SimulationResult(
+        final_balance=10.0 + total_pnl,
+        total_return=total_return,
+        trades=len(trades),
+        wins=sum(1 for r in rois if r > 0),
+        losses=sum(1 for r in rois if r < 0),
+        win_rate=sum(1 for r in rois if r > 0) / len(rois) if rois else 0.0,
+        gross_profit=sum(r for r in rois if r > 0),
+        gross_loss=sum(-r for r in rois if r < 0),
+        profit_factor=profit_factor,
+        total_pnl=total_pnl,
+        max_drawdown=max_drawdown,
+        equity_curve=[],
+        closed_trades=trades,
+    )
 
 
 def _write_features(tmp_path: Path, n: int = 100) -> Path:
@@ -126,3 +160,47 @@ def test_score_simulation_metrics_shape(tmp_path):
     result = sim.run(dataset.snapshots())
     score, metrics = score_simulation(result)
     assert {"profit_factor", "win_rate", "drawdown", "trades"} <= set(metrics)
+
+
+def test_score_simulation_caps_absurd_profit_factor():
+    result = _result_with_trades([0.2] * 30, profit_factor=1e12)
+    score, metrics = score_simulation(result)
+
+    assert metrics["profit_factor"] == PF_CAP
+    assert score == pytest.approx(
+        2.5 * PF_CAP + 1.5 * 1.0 + 2.0 * 0.2 - 3.0 * 0.0
+    )
+    assert abs(score) < 30  # bounded, not exploded by PF/total_pnl
+
+
+def test_score_simulation_ignores_compounding_pnl():
+    result = _result_with_trades(
+        [0.1, 0.1, 0.1],
+        profit_factor=2.0,
+        total_return=1e9,
+        total_pnl=1e12,
+    )
+    score, metrics = score_simulation(result)
+
+    assert metrics["avg_roi"] == pytest.approx(0.1)
+    assert score == pytest.approx(
+        2.5 * 2.0 + 1.5 * 1.0 + 2.0 * 0.1 - 3.0 * 0.0
+    )
+
+
+def test_score_simulation_zero_loss_caps_profit_factor():
+    result = _result_with_trades([0.3, 0.4], profit_factor=999.0)
+    score, metrics = score_simulation(result)
+
+    assert metrics["profit_factor"] == PF_CAP
+    assert metrics["avg_roi"] == pytest.approx(0.35)
+    assert score == pytest.approx(2.5 * PF_CAP + 1.5 * 1.0 + 2.0 * 0.35)
+
+
+def test_score_simulation_caps_avg_roi():
+    result = _result_with_trades([50.0, 60.0], profit_factor=5.0)
+    score, metrics = score_simulation(result)
+
+    assert metrics["avg_roi"] == ROI_CAP
+    assert score == pytest.approx(2.5 * PF_CAP + 1.5 * 1.0 + 2.0 * ROI_CAP)
+    assert abs(score) < 30
