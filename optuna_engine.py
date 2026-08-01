@@ -121,10 +121,33 @@ class SnapshotDataset:
         yield from self._iter(self._val_mask)
 
 
+def _compute_score(sim_config: "SimulatorConfig", strategy_config: "StrategyConfig") -> tuple[float, dict]:
+    """Worker-side entry point for the compute pool: run the simulator.
+
+    Uses the module-level ``_DATASET`` (inherited via fork copy-on-write),
+    so the ~8GB feature matrix stays shared instead of duplicated per worker.
+    """
+    global _DATASET
+    assert _DATASET is not None, "worker called before parent set _DATASET"
+
+    simulator = Simulator(sim_config, WeightedStrategy(strategy_config))
+    result = simulator.run(_DATASET.snapshots())
+
+    if result.trades < 20:
+        return -1e9, {
+            "profit_factor": 0.0,
+            "win_rate": 0.0,
+            "drawdown": 0.0,
+            "trades": int(result.trades),
+        }
+    return score_simulation(result)
+
+
 class Objective:
-    def __init__(self, config: OptunaConfig, dataset: SnapshotDataset):
+    def __init__(self, config: OptunaConfig, dataset: SnapshotDataset, pool=None):
         self.config = config
         self.dataset = dataset
+        self.pool = pool
 
     def _strategy(self, trial: optuna.Trial) -> StrategyConfig:
         weights: dict[str, float] = {}
@@ -153,8 +176,8 @@ class Objective:
             scaler=self.dataset.scaler,
         )
 
-    def _simulator(self, trial: optuna.Trial) -> Simulator:
-        simulator_config = SimulatorConfig(
+    def _simulator_config(self, trial: optuna.Trial) -> SimulatorConfig:
+        return SimulatorConfig(
             position_size=trial.suggest_float("position_size", 0.05, 1.0),
             stop_loss=trial.suggest_float("stop_loss", 0.03, 0.60),
             take_profit=trial.suggest_float("take_profit", 0.10, 5.00),
@@ -163,24 +186,40 @@ class Objective:
             ttl_seconds=trial.suggest_int("ttl_seconds", 5, 600),
             max_positions=trial.suggest_int("max_positions", 1, 10),
         )
-        strategy = WeightedStrategy(self._strategy(trial))
-        return Simulator(simulator_config, strategy)
 
-    def __call__(self, trial: optuna.Trial) -> float:
-        simulator = self._simulator(trial)
-        result = simulator.run(self.dataset.snapshots())
+    def _simulator(self, trial: optuna.Trial) -> Simulator:
+        return Simulator(
+            self._simulator_config(trial), WeightedStrategy(self._strategy(trial))
+        )
 
-        if result.trades < 20:
-            return -1e9
+    def _evaluate(self, trial, sim_config, strategy_config) -> float:
+        """Run one parameter set, returning the objective score.
 
-        score, metrics = score_simulation(result)
+        With a compute pool, the parent process (the sole SQLite writer)
+        samples the trial, submits the picklable configs to the pool, and
+        only collects the result — worker processes never touch storage.
+        """
+        if self.pool is not None:
+            score, metrics = self.pool.apply(
+                _compute_score, (sim_config, strategy_config)
+            )
+        else:
+            simulator = Simulator(sim_config, WeightedStrategy(strategy_config))
+            result = simulator.run(self.dataset.snapshots())
+            if result.trades < 20:
+                return -1e9
+            score, metrics = score_simulation(result)
 
         trial.set_user_attr("profit_factor", metrics["profit_factor"])
         trial.set_user_attr("win_rate", metrics["win_rate"])
         trial.set_user_attr("drawdown", metrics["drawdown"])
-        trial.set_user_attr("trades", int(result.trades))
-
+        trial.set_user_attr("trades", int(metrics["trades"]))
         return score
+
+    def __call__(self, trial: optuna.Trial) -> float:
+        sim_config = self._simulator_config(trial)
+        strategy_config = self._strategy(trial)
+        return self._evaluate(trial, sim_config, strategy_config)
 
 
 def score_simulation(result) -> tuple[float, dict]:
@@ -285,49 +324,6 @@ def _is_transient_storage_error(exc: Exception) -> bool:
     return False
 
 
-def _worker_main(config: OptunaConfig, trials: int, seed: int) -> None:
-    """Entry point for each forked Optuna worker process.
-
-    Runs ``study.optimize(n_jobs=1)`` against the shared SQLite study.
-    The feature matrix is read from the module-level ``_DATASET``, which
-    the parent populated before forking (shared via copy-on-write).
-    """
-    global _DATASET
-
-    assert _DATASET is not None, "worker called before parent set _DATASET"
-
-    objective = Objective(config, _DATASET)
-    pruner = optuna.pruners.MedianPruner(n_startup_trials=100, n_warmup_steps=10)
-
-    for attempt in range(1, 6):
-        try:
-            study = optuna.load_study(
-                study_name=config.study_name,
-                storage=config.storage,
-                pruner=pruner,
-            )
-            # `load_if_exists` restores the stored sampler, ignoring the one
-            # passed to create_study. Override per-worker so TPE RNGs diverge;
-            # otherwise every worker proposes identical trials.
-            study.sampler = optuna.samplers.TPESampler(seed=seed, multivariate=True)
-            study.optimize(
-                objective,
-                n_trials=trials,
-                timeout=config.timeout,
-                n_jobs=1,
-                show_progress_bar=False,
-            )
-            return
-        except Exception as e:
-            if not _is_transient_storage_error(e):
-                raise
-            if attempt == 5:
-                raise
-            print(f"[yellow]Worker transient storage error ({e}); retrying "
-                  f"(attempt {attempt + 1}/5)...[/]")
-            time.sleep(5 + attempt)
-
-
 class Optimizer:
     def __init__(self, config: OptunaConfig):
         self.config = config
@@ -390,13 +386,19 @@ class Optimizer:
                 time.sleep(10)
 
     def _run_parallel(self, objective: Objective) -> None:
-        """Fan out trials across N worker processes sharing one study.
+        """Optimize with a single writer process and a compute-only worker pool.
 
-        ``n_jobs`` in optuna 4.x uses a ThreadPoolExecutor, which the GIL
-        serializes for this pure-Python simulator. Instead we fork N worker
-        processes; each runs `study.optimize(n_trials=..., n_jobs=1)` against
-        the same SQLite study (distributed optuna). Fork + copy-on-write
-        shares the ~8GB feature matrix, so RAM stays ~8GB regardless of N.
+        Prior approach forked N processes, each running `study.optimize`
+        against one SQLite study. RDBStorage + SQLite serializes writers,
+        and N competing writers degenerated into a lock/retry loop: trials
+        registered as RUNNING but never reached COMPLETE.
+
+        Instead the parent process owns the study and is the *only* storage
+        writer: `study.optimize(n_jobs=processes)` samples trials in-process
+        (TPE is thread-safe) and each objective call submits picklable
+        configs to a fork-based `Pool`. Worker processes run only the
+        simulator against the COW-shared feature matrix and return the score;
+        they never touch SQLite, so there is zero writer contention.
         """
         import multiprocessing as mp
 
@@ -405,75 +407,38 @@ class Optimizer:
 
         processes = min(int(self.config.jobs) if self.config.jobs and self.config.jobs > 0 else 1,
                         os.cpu_count() or 1)
-        trials_per_worker = max(1, self.config.trials // processes)
 
-        # Ensure the study/database exists before forking, so workers only
-        # need to load_if_exists (no race creating the schema).
+        # Ensure the study/database exists before starting the pool.
         self.study()
 
         ctx = mp.get_context("fork")
-        workers = [
-            ctx.Process(
-                target=_worker_main,
-                args=(self.config, trials_per_worker, self.config.seed + i),
-                name=f"optuna-{i}",
-            )
-            for i in range(processes)
-        ]
+        pool = ctx.Pool(processes=processes)
+        objective.pool = pool
 
-        for w in workers:
-            w.start()
-
-        started = time.time()
         try:
-            while True:
-                alive = [w for w in workers if w.is_alive()]
-                if not alive:
-                    break
-                time.sleep(10)
-                done = self._count_complete()
-                elapsed = time.time() - started
-                rate = done / elapsed if elapsed > 0 else 0
-                print(
-                    f"  [bold cyan]{done}/{self.config.trials}[/] trials "
-                    f"[green]({rate:.1f}/s, ~{(self.config.trials - done) / max(rate, 1e-9):.0f}s left)[/]",
-                    flush=True,
-                )
-        finally:
-            for w in workers:
-                w.join()
-
-        # Surface any workers that died before finishing (e.g. OOM), so a
-        # silently-emptied pool is not mistaken for completion.
-        dead = [w for w in workers if w.exitcode and w.exitcode != 0]
-        if dead:
+            study = self.study()
+            # One sampler drives all trials (single-writer TPE), so a single
+            # seed suffices and proposals are consistent across the run.
+            study.optimize(
+                objective,
+                n_trials=self.config.trials,
+                timeout=self.config.timeout,
+                n_jobs=processes,
+                show_progress_bar=False,
+            )
+        except (BrokenPipeError, EOFError, OSError) as e:
             raise RuntimeError(
-                f"{len(dead)}/{len(workers)} optuna workers exited with "
-                f"code(s): {[w.exitcode for w in dead]}. Trials completed: "
-                f"{self._num_complete()}."
-            )
+                f"Compute pool failed ({e}). Trials completed: {self._num_complete()}. "
+                f"Completed trials persist in the study; re-run to resume."
+            ) from e
+        finally:
+            pool.close()
+            pool.join()
 
-        if self._num_complete() == 0:
+        done = self._num_complete()
+        if done == 0:
             raise RuntimeError("Parallel optimization produced no complete trials.")
-
-    def _count_complete(self) -> int:
-        """Count COMPLETE trials for this study via a direct SQL query (lightweight)."""
-        if not self.config.storage.startswith("sqlite:///"):
-            return self._num_complete()
-        import sqlite3
-
-        db_path = self.config.storage.replace("sqlite:///", "", 1)
-        try:
-            with sqlite3.connect(db_path, timeout=60) as con:
-                row = con.execute(
-                    "SELECT COUNT(*) FROM trials t "
-                    "JOIN studies s ON t.study_id = s.study_id "
-                    "WHERE s.study_name = ? AND t.state = 'COMPLETE'",
-                    (self.config.study_name,),
-                ).fetchone()
-            return int(row[0]) if row else 0
-        except sqlite3.Error:
-            return self._num_complete()
+        print(f"  [bold cyan]{done}/{self.config.trials}[/] trials complete", flush=True)
 
     def _num_complete(self) -> int:
         study = self.study()
