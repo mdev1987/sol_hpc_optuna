@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +12,11 @@ import optuna
 
 from feature_engine import FeatureSnapshot
 from simulator import Simulator, SimulatorConfig, StrategyConfig, WeightedStrategy
+
+# Module-level handle to the shared feature matrix. Set in the parent
+# process before forking; children inherit it via copy-on-write, so the
+# ~8GB dataset is shared (not duplicated once per worker).
+_DATASET: SnapshotDataset | None = None
 
 
 def _finite(value: float, fallback: float = 0.0) -> float:
@@ -151,7 +158,6 @@ class Objective:
 
         return score
 
-
 def _is_transient_storage_error(exc: Exception) -> bool:
     """Storage failures worth retrying: SQLite lock/commit errors and the
     known optuna `_optimize.py` UnboundLocalError triggered by them."""
@@ -164,6 +170,49 @@ def _is_transient_storage_error(exc: Exception) -> bool:
         message = str(exc)
         return any(name in message for name in ("updated_state", "updated_sate", "frozen_trial"))
     return False
+
+
+def _worker_main(config: OptunaConfig, trials: int, seed: int) -> None:
+    """Entry point for each forked Optuna worker process.
+
+    Runs ``study.optimize(n_jobs=1)`` against the shared SQLite study.
+    The feature matrix is read from the module-level ``_DATASET``, which
+    the parent populated before forking (shared via copy-on-write).
+    """
+    global _DATASET
+
+    assert _DATASET is not None, "worker called before parent set _DATASET"
+
+    objective = Objective(config, _DATASET)
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=100, n_warmup_steps=10)
+
+    for attempt in range(1, 6):
+        try:
+            study = optuna.load_study(
+                study_name=config.study_name,
+                storage=config.storage,
+                pruner=pruner,
+            )
+            # `load_if_exists` restores the stored sampler, ignoring the one
+            # passed to create_study. Override per-worker so TPE RNGs diverge;
+            # otherwise every worker proposes identical trials.
+            study.sampler = optuna.samplers.TPESampler(seed=seed, multivariate=True)
+            study.optimize(
+                objective,
+                n_trials=trials,
+                timeout=config.timeout,
+                n_jobs=1,
+                show_progress_bar=False,
+            )
+            return
+        except Exception as e:
+            if not _is_transient_storage_error(e):
+                raise
+            if attempt == 5:
+                raise
+            print(f"[yellow]Worker transient storage error ({e}); retrying "
+                  f"(attempt {attempt + 1}/5)...[/]")
+            time.sleep(5 + attempt)
 
 
 class Optimizer:
@@ -201,33 +250,110 @@ class Optimizer:
             pruner=pruner,
         )
 
-    def run(self) -> OptimizationResult:
-        objective = Objective(self.config, self.dataset)
-        max_attempts = 5
-
-        for attempt in range(1, max_attempts + 1):
+    def _run_sequential(self, objective: Objective) -> None:
+        """Run all trials in this process, single-core."""
+        for attempt in range(1, 6):
             try:
                 study = self.study()
                 study.optimize(
                     objective,
                     n_trials=self.config.trials,
                     timeout=self.config.timeout,
-                    n_jobs=self.config.jobs,
+                    n_jobs=1,
                     show_progress_bar=True,
                 )
-                break
+                return
             except Exception as e:
                 if not _is_transient_storage_error(e):
                     raise
-                if attempt == max_attempts:
+                if attempt == 5:
                     raise
                 print(f"\n[bold yellow]Transient storage error ({e}); retrying in 10s "
-                      f"(attempt {attempt + 1}/{max_attempts})...[/]")
-                import time
-
+                      f"(attempt {attempt + 1}/5)...[/]")
                 time.sleep(10)
 
-        best = study.best_trial
+    def _run_parallel(self, objective: Objective) -> None:
+        """Fan out trials across N worker processes sharing one study.
+
+        ``n_jobs`` in optuna 4.x uses a ThreadPoolExecutor, which the GIL
+        serializes for this pure-Python simulator. Instead we fork N worker
+        processes; each runs `study.optimize(n_trials=..., n_jobs=1)` against
+        the same SQLite study (distributed optuna). Fork + copy-on-write
+        shares the ~8GB feature matrix, so RAM stays ~8GB regardless of N.
+        """
+        import multiprocessing as mp
+
+        global _DATASET
+        _DATASET = self.dataset
+
+        processes = min(int(self.config.jobs) if self.config.jobs and self.config.jobs > 0 else 1,
+                        os.cpu_count() or 1)
+        trials_per_worker = max(1, self.config.trials // processes)
+
+        # Ensure the study/database exists before forking, so workers only
+        # need to load_if_exists (no race creating the schema).
+        self.study()
+
+        ctx = mp.get_context("fork")
+        workers = [
+            ctx.Process(
+                target=_worker_main,
+                args=(self.config, trials_per_worker, self.config.seed + i),
+                name=f"optuna-{i}",
+            )
+            for i in range(processes)
+        ]
+
+        for w in workers:
+            w.start()
+
+        started = time.time()
+        try:
+            while any(w.is_alive() for w in workers):
+                time.sleep(10)
+                done = self._count_complete()
+                elapsed = time.time() - started
+                rate = done / elapsed if elapsed > 0 else 0
+                print(
+                    f"  [bold cyan]{done}/{self.config.trials}[/] trials "
+                    f"[green]({rate:.1f}/s, ~{(self.config.trials - done) / max(rate, 1e-9):.0f}s left)[/]"
+                )
+        finally:
+            for w in workers:
+                w.join()
+
+        if self._num_complete() == 0:
+            raise RuntimeError("Parallel optimization produced no complete trials.")
+
+    def _count_complete(self) -> int:
+        """Count COMPLETE trials via a direct SQL query (lightweight)."""
+        if not self.config.storage.startswith("sqlite:///"):
+            return self._num_complete()
+        import sqlite3
+
+        db_path = self.config.storage.replace("sqlite:///", "", 1)
+        try:
+            with sqlite3.connect(db_path, timeout=60) as con:
+                row = con.execute(
+                    "SELECT COUNT(*) FROM trials WHERE state = 'COMPLETE'"
+                ).fetchone()
+            return int(row[0]) if row else 0
+        except sqlite3.Error:
+            return self._num_complete()
+
+    def _num_complete(self) -> int:
+        study = self.study()
+        return len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+
+    def run(self) -> OptimizationResult:
+        objective = Objective(self.config, self.dataset)
+
+        if self.config.jobs and self.config.jobs > 1:
+            self._run_parallel(objective)
+        else:
+            self._run_sequential(objective)
+
+        best = self.study().best_trial
         result = OptimizationResult(
             score=best.value,
             trial=best.number,
