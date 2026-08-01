@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 
+from logger import log
 from simulator import SimulatorConfig
 
 
@@ -46,6 +47,13 @@ class DatasetBuilder:
 
         labels = np.asarray(self._compute_labels(features_df), dtype=np.int8)
 
+        pos_count = int(np.count_nonzero(labels == 1))
+        neg_count = int(np.count_nonzero(labels == 0))
+        log.info(
+            f"Labeled {labels.size} events: {pos_count} positive ({pos_count / max(labels.size, 1):.1%}), "
+            f"{neg_count} negative ({neg_count / max(labels.size, 1):.1%})"
+        )
+
         if balanced and labels.size:
             pos = np.flatnonzero(labels == 1)
             neg = np.flatnonzero(labels == 0)
@@ -58,6 +66,10 @@ class DatasetBuilder:
                 keep = np.sort(keep)
                 features_df = features_df[keep]
                 labels = labels[keep]
+                log.info(
+                    f"Balanced subsample kept {int(count)} per class "
+                    f"({len(keep)} rows total)"
+                )
 
         meta = {"mint", "timestamp", "slot"}
         feature_cols = [c for c in features_df.columns if c not in meta and c != "label"]
