@@ -12,6 +12,7 @@ from optuna_engine import (
     evaluate_params,
     score_simulation,
     _min_trades_for,
+    _rejected,
     _strategy_from_params,
 )
 from simulator import ExitReason, SimulationResult, Simulator, Trade, WeightedStrategy
@@ -213,6 +214,22 @@ def test_score_simulation_caps_avg_roi():
     assert metrics["avg_roi"] == ROI_CAP
     assert score == pytest.approx(2.5 * PF_CAP + 1.5 * 1.0 + 2.0 * ROI_CAP)
     assert abs(score) < 30
+
+
+def test_score_simulation_rejects_below_breakeven():
+    # High win rate, but gross losses exceed gross gains (PF 0.35).
+    result = _result_with_trades([0.02] * 9 + [-0.60], profit_factor=0.35)
+    score, metrics = score_simulation(result)
+
+    assert metrics["profit_factor"] == pytest.approx(0.35)
+    assert metrics["win_rate"] == pytest.approx(0.9)  # would score positive without the guard
+    assert score == _rejected(result.trades)
+
+
+def test_rejected_gives_gradient():
+    assert _rejected(149) > _rejected(10)
+    assert _rejected(0) == -1e9
+    assert _rejected(10) > -1e9
 
 
 def test_validation_floor_is_proportional(tmp_path):

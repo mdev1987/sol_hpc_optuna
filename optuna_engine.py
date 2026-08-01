@@ -287,7 +287,7 @@ def _compute_score(sim_config: "SimulatorConfig", strategy_config: "StrategyConf
     )
 
     if result.trades < MIN_TRAIN_TRADES:
-        return -1e9, {
+        return _rejected(result.trades), {
             "profit_factor": 0.0,
             "win_rate": 0.0,
             "drawdown": 0.0,
@@ -321,8 +321,8 @@ class Objective:
             max_market_cap=trial.suggest_float("max_market_cap", min_market_cap, 200_000),
             min_volume=trial.suggest_float("min_volume", 1.0, 50),
             min_buy_ratio=trial.suggest_float("min_buy_ratio", 0.10, 0.95),
-            min_trades=trial.suggest_int("min_trades", 1, 500),
-            min_wallets=trial.suggest_int("min_wallets", 1, 300),
+            min_trades=trial.suggest_int("min_trades", 1, 200),
+            min_wallets=trial.suggest_int("min_wallets", 1, 150),
             min_wallet_velocity=trial.suggest_float("min_wallet_velocity", 0.0, 5.0),
             minimum_score=trial.suggest_float("minimum_score", -2.0, 2.0),
             weights=weights,
@@ -360,7 +360,7 @@ class Objective:
             simulator = Simulator(sim_config, WeightedStrategy(strategy_config))
             result = simulator.run(self.dataset.snapshots())
             if result.trades < MIN_TRAIN_TRADES:
-                return -1e9
+                return _rejected(result.trades)
             score, metrics = score_simulation(result)
 
         trial.set_user_attr("profit_factor", metrics["profit_factor"])
@@ -412,18 +412,16 @@ def score_simulation(result) -> tuple[float, dict]:
     max drawdown. Raw ``total_return``/``total_pnl`` are deliberately excluded
     because they explode with position sizing, rewarding leverage instead of
     edge.
+
+    A result that fails to break even (profit factor < 1.0) is rejected: a
+    net-losing strategy must never win, even if its win rate is high (a high
+    win rate with small wins / large losses still loses money).
     """
     profit_factor = min(_finite(result.profit_factor), PF_CAP)
     win_rate = _finite(result.win_rate)
     max_drawdown = _finite(result.max_drawdown)
     avg_roi = min(_avg_trade_roi(result.closed_trades), ROI_CAP)
 
-    score = (
-        2.5 * profit_factor
-        + 1.5 * win_rate
-        + 2.0 * avg_roi
-        - 3.0 * max_drawdown
-    )
     metrics = {
         "profit_factor": profit_factor,
         "win_rate": win_rate,
@@ -431,7 +429,27 @@ def score_simulation(result) -> tuple[float, dict]:
         "trades": int(result.trades),
         "avg_roi": avg_roi,
     }
+    if profit_factor < 1.0:
+        return _rejected(result.trades), metrics
+
+    score = (
+        2.5 * profit_factor
+        + 1.5 * win_rate
+        + 2.0 * avg_roi
+        - 3.0 * max_drawdown
+    )
     return score, metrics
+
+
+def _rejected(trades: int) -> float:
+    """Score for a rejected parameter set.
+
+    ``-1e9`` alone would make every rejected trial identical, giving the TPE
+    sampler no gradient to climb toward feasibility; adding the trade count
+    lets trials with more trades rank above ones with fewer, so the search
+    can still learn which direction increases trades.
+    """
+    return -1e9 + int(trades)
 
 
 def _avg_trade_roi(trades) -> float:
@@ -497,7 +515,7 @@ def evaluate_params(
     snapshots = dataset.validation_snapshots() if on_validation else dataset.snapshots()
     result = simulator.run(snapshots)
     if result.trades < _min_trades_for(dataset, on_validation):
-        return -1e9, {
+        return _rejected(result.trades), {
             "profit_factor": 0.0,
             "win_rate": 0.0,
             "drawdown": 0.0,
