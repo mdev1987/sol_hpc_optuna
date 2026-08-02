@@ -29,9 +29,10 @@
 #                       set 0 to resume the existing study. Archiving is a
 #                       rename, never a delete.
 #   SHUTDOWN_AFTER_UPLOAD=0|1
-#                       power off the VPS after a COMPLETE run whose upload was
-#                       verified (default 1). Requires root/passwordless sudo;
-#                       if it fails the VPS stays on and the error is logged.
+#                       power off the VPS after any run whose upload was
+#                       verified (complete or partial; default 1). Requires
+#                       root/passwordless sudo; if it fails the VPS stays on
+#                       and the error is logged.
 #   EXTRA_RCLONE_FLAGS  extra flags passed to rclone (e.g. --drive-chunk-size 128M)
 #
 # Examples:
@@ -260,7 +261,7 @@ else
 fi
 
 _log "=== done $(date '+%Y-%m-%d %H:%M:%S') ==="
-if [ "${uploaded}" = "1" ] && [ "${outcome}" = "COMPLETE" ]; then
+if [ "${uploaded}" = "1" ]; then
     if [ "${SHUTDOWN_AFTER_UPLOAD}" = "1" ]; then
         _log "all results uploaded to ${RCLONE_DEST}; powering off the VPS in 30s..."
         sleep 30
@@ -270,6 +271,8 @@ if [ "${uploaded}" = "1" ] && [ "${outcome}" = "COMPLETE" ]; then
             sudo shutdown -h now || _log "warning: shutdown command failed; power off the VPS manually."
         fi
     fi
-    exit 0
+    if [ "${outcome}" = "COMPLETE" ]; then
+        exit 0
+    fi
 fi
 exit 1
