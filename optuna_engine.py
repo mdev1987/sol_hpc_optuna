@@ -123,28 +123,33 @@ class SnapshotDataset:
             self.work_columns = [c for c in self.feature_columns if c in wanted]
         self._work_index = {c: j for j, c in enumerate(self.work_columns)}
 
-        features_frame = self.frame.select(self.feature_columns)
-        full = np.nan_to_num(features_frame.to_numpy(), nan=0.0, posinf=0.0, neginf=0.0)
-        full = full.astype(np.float64)
+        # Build ONLY the reduced working matrix -- never the all-features
+        # `full` copy. Drop the polars frame as soon as it has been converted
+        # so the ~GB-scale source copy is not retained (nor inherited by fork
+        # workers via copy-on-write). At SAMPLE_FRACTION=1.0 this frame alone
+        # was ~24GB and pushed the VPS past its memory cgroup cap.
+        work_frame = self.frame.select(self.work_columns)
+        work = work_frame.to_numpy()
+        del work_frame
+        if work.dtype != np.float64:
+            work = work.astype(np.float64)
+        np.nan_to_num(work, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+        del self.frame
 
-        train_features = full[self._train_mask]
-        means = train_features.mean(axis=0)
-        stds = train_features.std(axis=0)
+        train_work = work[self._train_mask]
+        means = train_work.mean(axis=0)
+        stds = train_work.std(axis=0)
+        # Scalers are only ever looked up for bundle features, which are a
+        # subset of the working columns, so work-column stats are sufficient.
         self.scaler = {
             col: (float(means[j]), float(stds[j]))
-            for j, col in enumerate(self.feature_columns)
+            for j, col in enumerate(self.work_columns)
         }
 
-        # Reduced raw matrix + standardized matrix over working columns.
-        work_idx = [self.feature_columns.index(c) for c in self.work_columns]
-        self._work = full[:, work_idx].copy()
-        del full
-
-        work_means = np.array([means[j] for j in work_idx])
-        work_stds = np.array([stds[j] for j in work_idx])
+        self._work = work
         self._z = np.zeros_like(self._work)
-        safe = work_stds > 0
-        self._z[:, safe] = (self._work[:, safe] - work_means[safe]) / work_stds[safe]
+        safe = stds > 0
+        self._z[:, safe] = (self._work[:, safe] - means[safe]) / stds[safe]
 
         self._prices = self._work[:, self._work_index["price"]]
 

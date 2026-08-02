@@ -35,7 +35,6 @@ Flow: download features.zip + optuna.db -> extract features.parquet
 
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
 import subprocess
