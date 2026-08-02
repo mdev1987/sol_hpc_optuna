@@ -1,27 +1,35 @@
 #!/usr/bin/env python3
-"""Kaggle runner for the flow 5000-trial study.
+"""Kaggle runner for the flow 5000-trial study (gdown download).
 
-Paste into a Kaggle notebook cell (or run as a script) from the repo root:
+Make the Drive files shareable ("Anyone with the link"), copy each file ID
+from its share URL, then from the repo root in a notebook cell:
 
     import os
-    os.environ["KAGGLE_REMOTE"] = "gdrive:sol_optunal_hpc"   # your Drive folder
-    os.environ["RCLONE_CONF"] = "... contents of ~/.config/rclone/rclone.conf ..."
+    os.environ["KAGGLE_FEATURES_ID"] = "<file id of cache_features.zip>"
+    os.environ["KAGGLE_DB_ID"]       = "<file id of optuna.db>"   # optional
     %run scripts/kaggle_flow_run.py
 
 Env knobs (all optional):
-    KAGGLE_REMOTE      rclone remote:path of your Drive folder
-                       (default gdrive:sol_optuna_hpc)
-    KAGGLE_TRIALS      trials to run (default 50 -- small for the Kaggle test)
-    KAGGLE_WORKERS     worker processes (default os.cpu_count(); Kaggle free ~4)
-    KAGGLE_BUNDLE      bundle (default flow)
-    KAGGLE_SAMPLE      sample_fraction (default 1.0)
-    KAGGLE_FRESH       "1" archives any existing optuna.db and starts clean
-                       (default 1, recommended: the old db is 0.3-sample ablation)
-    KAGGLE_UPLOAD      "1" uploads results back to KAGGLE_REMOTE/<prefix> (default 1)
-    KAGGLE_PREFIX      upload folder prefix (default kaggle_run)
-    RCLONE_CONF        contents of rclone.conf; written to /root/.config/rclone/rclone.conf
+    KAGGLE_FEATURES_ID   Drive file id of cache_features.zip (required to download)
+    KAGGLE_DB_ID         Drive file id of optuna.db
+    KAGGLE_SELECTED_ID   Drive file id of selected_features.json
+    KAGGLE_TRIALS        trials to run (default 50 -- small for the Kaggle test)
+    KAGGLE_WORKERS       worker processes (default os.cpu_count(); Kaggle free ~4)
+    KAGGLE_BUNDLE        bundle (default flow)
+    KAGGLE_SAMPLE        sample_fraction (default 1.0)
+    KAGGLE_FRESH         "1" archives any existing optuna.db and starts clean
+                         (default 1: the old db is 0.3-sample ablation)
+    KAGGLE_UPLOAD        "1" uploads results back via rclone (default 1; needs
+                         a configured gdrive remote, else skipped with a note)
+    KAGGLE_REMOTE        rclone remote:path used only for upload-back
+                         (default gdrive:sol_optuna_hpc)
+    RCLONE_CONF          contents of ~/.config/rclone/rclone.conf, written to
+                         /root/.config/rclone/rclone.conf (only needed for upload)
 
-Flow: preflight -> rclone download (features.zip, optuna.db, selected_features.json)
+Download uses gdown (no auth if files are link-shared). If gdown is missing it
+falls back to rclone for files it can find in KAGGLE_REMOTE.
+
+Flow: download features.zip + optuna.db -> extract features.parquet
       -> fresh study -> optimize (streaming progress) -> upload back -> verify.
 """
 
@@ -36,14 +44,16 @@ import time
 import zipfile
 from pathlib import Path
 
-REMOTE = os.environ.get("KAGGLE_REMOTE", "gdrive:sol_optuna_hpc")
+FEATURES_ID = os.environ.get("KAGGLE_FEATURES_ID", "")
+DB_ID = os.environ.get("KAGGLE_DB_ID", "")
+SELECTED_ID = os.environ.get("KAGGLE_SELECTED_ID", "")
 TRIALS = int(os.environ.get("KAGGLE_TRIALS", "50"))
 WORKERS = int(os.environ.get("KAGGLE_WORKERS", str(max(1, os.cpu_count() or 1))))
 BUNDLE = os.environ.get("KAGGLE_BUNDLE", "flow")
 SAMPLE = os.environ.get("KAGGLE_SAMPLE", "1.0")
 FRESH = os.environ.get("KAGGLE_FRESH", "1") == "1"
 UPLOAD = os.environ.get("KAGGLE_UPLOAD", "1") == "1"
-PREFIX = os.environ.get("KAGGLE_PREFIX", "kaggle_run")
+REMOTE = os.environ.get("KAGGLE_REMOTE", "gdrive:sol_optuna_hpc")
 
 ROOT = Path.cwd()
 CACHE = ROOT / "cache"
@@ -52,7 +62,7 @@ LOG_DIR = ROOT / "logs"
 DB = ROOT / "optuna.db"
 STUDY = f"replay_optuna_{BUNDLE}"
 SYNC = ROOT / "gdrive_sync"
-DEST = f"{REMOTE}/{PREFIX}_{time.strftime('%Y%m%d-%H%M%S')}"
+DEST = f"{REMOTE}/{BUNDLE}_kaggle_{time.strftime('%Y%m%d-%H%M%S')}"
 
 
 def sh(cmd: str, **kw) -> subprocess.CompletedProcess:
@@ -61,53 +71,59 @@ def sh(cmd: str, **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, shell=True, check=True, **kw)
 
 
-def ensure_rclone() -> None:
-    if shutil_which("rclone"):
-        print(f"rclone present at {shutil_which('rclone')}", flush=True)
-        return
-    sh("curl -sSLo /tmp/rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip")
-    sh("unzip -oq /tmp/rclone.zip -d /tmp/rclone_extract")
-    sh("cp /tmp/rclone_extract/rclone-*-linux-amd64/rclone /usr/local/bin/")
-    sh("rclone version")
-
-
-def shutil_which(name: str) -> str | None:
+def rclone_ready() -> bool:
     import shutil
 
-    return shutil.which(name)
+    return shutil.which("rclone") is not None
 
 
-def configure_rclone() -> None:
-    conf_dir = Path("/root/.config/rclone")
-    conf = conf_dir / "rclone.conf"
-    if conf.exists():
-        return
-    conf_body = os.environ.get("RCLONE_CONF")
-    if conf_body:
-        conf_dir.mkdir(parents=True, exist_ok=True)
-        conf.write_text(conf_body)
-        return
-    if (ROOT / "rclone.conf").exists():
-        conf_dir.mkdir(parents=True, exist_ok=True)
-        sh(f"cp {ROOT / 'rclone.conf'} {conf}")
-        return
-    raise SystemExit(
-        "rclone.conf not found. Set RCLONE_CONF to the contents of your "
-        "~/.config/rclone/rclone.conf (from the VPS) or place it at ./rclone.conf"
-    )
+def ensure_gdown():
+    try:
+        import gdown  # noqa: F401
+    except ImportError:
+        sh("pip install -q gdown")
+    import gdown  # noqa: F401
+
+    return gdown
+
+
+def gdown_get(gdown, file_id: str, output: Path) -> None:
+    if not file_id:
+        return False
+    print(f"downloading id {file_id} -> {output}", flush=True)
+    gdown.download(id=file_id, output=str(output), quiet=False)
+    if not output.exists():
+        raise SystemExit(f"gdown failed for id {file_id}; the file must be "
+                         f"shared as 'Anyone with the link'")
+    return True
 
 
 def download_data() -> None:
+    gdown = ensure_gdown()
+    CACHE.mkdir(exist_ok=True)
     SYNC.mkdir(exist_ok=True)
-    listed = sh(f"rclone lsf {REMOTE}", capture_output=True).stdout
-    print(f"Drive folder contains:\n{listed}", flush=True)
-    if "cache_features.zip" not in listed:
-        raise SystemExit(f"'cache_features.zip' not found in {REMOTE}")
-    sh(f"rclone copy {REMOTE}/cache_features.zip {SYNC} --progress")
-    if "optuna.db" in listed:
+
+    ok = gdown_get(gdown, FEATURES_ID, SYNC / "cache_features.zip")
+    if not ok and rclone_ready():
+        print("falling back to rclone download", flush=True)
+        sh(f"rclone copy {REMOTE}/cache_features.zip {SYNC}")
+        ok = (SYNC / "cache_features.zip").exists()
+    if not ok:
+        raise SystemExit("need cache_features.zip: set KAGGLE_FEATURES_ID "
+                         "(or configure rclone and set KAGGLE_REMOTE)")
+
+    db_target = SYNC / "optuna.db"
+    if not gdown_get(gdown, DB_ID, db_target) and rclone_ready():
         sh(f"rclone copy {REMOTE}/optuna.db {SYNC}")
-    if "selected_features.json" in listed:
+    if db_target.exists():
+        db_target.rename(DB)
+
+    sel_target = CACHE / "selected_features.json"
+    if not gdown_get(gdown, SELECTED_ID, sel_target) and rclone_ready():
         sh(f"rclone copy {REMOTE}/selected_features.json {CACHE}")
+
+    if DB_ID and not DB.exists():
+        print("note: optuna.db not downloaded; starting a brand-new study", flush=True)
 
 
 def extract_features() -> None:
@@ -120,14 +136,10 @@ def extract_features() -> None:
             raise SystemExit("no .parquet found inside cache_features.zip")
         print(f"extracting {candidate} -> {target}", flush=True)
         with zf.open(candidate) as src, open(target, "wb") as dst:
-            shutil_copyfileobj(src, dst)
+            import shutil
+
+            shutil.copyfileobj(src, dst, 64 * 1024 * 1024)
     print(f"features.parquet: {target.stat().st_size / 2**30:.2f} GiB", flush=True)
-
-
-def shutil_copyfileobj(src, dst, length: int = 64 * 1024 * 1024) -> None:
-    import shutil
-
-    shutil.copyfileobj(src, dst, length)
 
 
 def prepare_study() -> None:
@@ -170,7 +182,8 @@ def run_optimize() -> int:
         time.sleep(60)
         n = count_complete()
         if n != last:
-            print(f"[{time.strftime('%H:%M:%S')}] progress: {n}/{TRIALS} trials ({n * 100 // TRIALS}%)", flush=True)
+            print(f"[{time.strftime('%H:%M:%S')}] progress: {n}/{TRIALS} trials "
+                  f"({n * 100 // TRIALS}%)", flush=True)
             last = n
     rc = proc.wait()
     final = count_complete()
@@ -180,15 +193,31 @@ def run_optimize() -> int:
 
 
 def upload_back(status: str, rc: int) -> bool:
-    if not UPLOAD:
-        print("KAGGLE_UPLOAD=0, skipping upload", flush=True)
-        return True
     REPORT_DIR.mkdir(exist_ok=True)
     status_file = LOG_DIR / f"final_status_{BUNDLE}.txt"
     status_file.write_text(
         f"study: {STUDY}\noutcome: {status}\ncompleted trials: {count_complete()}/{TRIALS}\n"
         f"rc: {rc}\nfinished: {time.strftime('%Y-%m-%d %H:%M:%S')}\nbundle: {BUNDLE}\n"
     )
+    if not UPLOAD:
+        print("KAGGLE_UPLOAD=0, skipping upload", flush=True)
+        return True
+    if not rclone_ready():
+        print(f"rclone not installed; results are in /kaggle/working: "
+              f"{DB}, {REPORT_DIR}, {LOG_DIR} (download via the sidebar)", flush=True)
+        return True
+
+    conf = Path("/root/.config/rclone/rclone.conf")
+    if not conf.exists():
+        body = os.environ.get("RCLONE_CONF")
+        if body:
+            conf.parent.mkdir(parents=True, exist_ok=True)
+            conf.write_text(body)
+        else:
+            print(f"rclone has no gdrive config; results are in /kaggle/working: "
+                  f"{DB}, {REPORT_DIR}, {LOG_DIR}", flush=True)
+            return True
+
     assets = [str(DB), str(REPORT_DIR), str(status_file), str(LOG_DIR / f"final_run_{BUNDLE}.log")]
     selected = CACHE / "selected_features.json"
     if selected.exists():
@@ -220,26 +249,21 @@ def upload_back(status: str, rc: int) -> bool:
 
 def main() -> int:
     if sys.version_info < (3, 11):
-        raise SystemExit(f"Python >= 3.11 required (have {sys.version_info.major}.{sys.version_info.minor})")
-    ensure_rclone()
-    configure_rclone()
+        raise SystemExit(
+            f"Python >= 3.11 required (have {sys.version_info.major}.{sys.version_info.minor})")
     download_data()
     extract_features()
     prepare_study()
     ok = run_optimize() == 0
     status = "COMPLETE" if ok else "FAILED"
     uploaded = upload_back(status, 0 if ok else 1)
-    print(f"=== done: outcome={status} upload={'OK' if uploaded else 'FAILED'} dest={DEST} ===", flush=True)
+    print(f"=== done: outcome={status} upload={'OK' if uploaded else 'FAILED'} ===", flush=True)
     return 0 if (ok and uploaded) else 1
 
 
 if __name__ == "__main__":
-    import shutil
-
     try:
         sys.exit(main())
-    except SystemExit as e:
-        raise
     except KeyboardInterrupt:
         print("interrupted; partial results are in the local db", flush=True)
         sys.exit(130)
