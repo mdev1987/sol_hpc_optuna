@@ -13,11 +13,11 @@ __pycache__/
 downloads/
 cache/
 parquet/
-reports/
 logs/
 models/
 
-uv.lock
+reports/pumpapi_doc.md
+
 download_links.txt
 sol_optuna_results/
 .ruff_cache/

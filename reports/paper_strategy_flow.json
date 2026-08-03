@@ -1,0 +1,125 @@
+{
+    "trial": 2414,
+    "score": 19.90954681170388,
+    "metrics": {
+        "profit_factor": 5.0,
+        "win_rate": 0.9396984924623115,
+        "drawdown": 3.089965296718839e-07,
+        "trades": 199,
+        "val_score": 14.548409365386743,
+        "val_profit_factor": 5.0,
+        "val_win_rate": 0.6862745098039216,
+        "val_drawdown": 0.06080641295127279,
+        "val_trades": 51,
+        "val_avg_roi": 0.6007084197673395
+    },
+    "features": [
+        "liquidity",
+        "liquidity_change",
+        "market_cap",
+        "avg_trade",
+        "largest_buy",
+        "largest_sell",
+        "age_seconds",
+        "trade_velocity",
+        "wallet_velocity",
+        "buys",
+        "sells",
+        "volume",
+        "unique_wallets",
+        "sell_ratio"
+    ],
+    "scaler": {
+        "liquidity": [
+            499128472.15376073,
+            952373615270.515
+        ],
+        "liquidity_change": [
+            707961182.4580523,
+            1737321686701.801
+        ],
+        "market_cap": [
+            207508586566365.38,
+            4.606070335237214e+17
+        ],
+        "avg_trade": [
+            3151653777.7616634,
+            45777599869.31086
+        ],
+        "largest_buy": [
+            230220334.03244933,
+            74024747383.51256
+        ],
+        "largest_sell": [
+            354615624779.3355,
+            2530892122962.9917
+        ],
+        "age_seconds": [
+            6928.591370817278,
+            12780.12589956963
+        ],
+        "trade_velocity": [
+            3.742141667164004,
+            3.349205363639101
+        ],
+        "wallet_velocity": [
+            1.3004944683492776,
+            2.2044372615925667
+        ],
+        "buys": [
+            6861.806396889557,
+            12758.64943575085
+        ],
+        "sells": [
+            3093.4820470826844,
+            5459.951064925591
+        ],
+        "volume": [
+            27533560754706.637,
+            336057111990250.4
+        ],
+        "unique_wallets": [
+            1248.3229680030338,
+            1513.8214676214714
+        ],
+        "sell_ratio": [
+            0.45712813368896954,
+            0.21089223535991236
+        ]
+    },
+    "parameters": {
+        "position_size": 0.23122680080190722,
+        "stop_loss": 0.11391725186130941,
+        "take_profit": 1.238560477566684,
+        "trailing_trigger": 1.0480104878640806,
+        "trailing_stop": 0.2767850446077034,
+        "ttl_seconds": 109,
+        "max_positions": 2,
+        "w_liquidity": 0.15629019877163963,
+        "w_liquidity_change": 4.168457153793491,
+        "w_market_cap": 4.730224761713531,
+        "w_avg_trade": -4.986742524243403,
+        "w_largest_buy": 0.6539635522313847,
+        "w_largest_sell": 2.3042340252126894,
+        "w_age_seconds": 2.3077177634503183,
+        "w_trade_velocity": -0.02782390357644282,
+        "w_wallet_velocity": -0.5120425115013698,
+        "w_buys": 4.94788606776771,
+        "w_sells": -3.877805705020256,
+        "w_volume": 4.582154847268212,
+        "w_unique_wallets": -4.409299173809861,
+        "w_sell_ratio": -4.758915085273542,
+        "min_liquidity": 255.80598619040893,
+        "min_market_cap": 6377.924321422064,
+        "min_price_change_5": -0.02006710426134567,
+        "min_price_change_20": -0.26254160547627825,
+        "max_liquidity": 41837.2840908376,
+        "max_market_cap": 185859.67656834784,
+        "min_volume": 32.18931684889907,
+        "min_buy_ratio": 0.9418140840095008,
+        "min_trades": 132,
+        "min_wallets": 67,
+        "min_wallet_velocity": 1.1193734124356323,
+        "minimum_score": -1.8224609169109136
+    }
+}

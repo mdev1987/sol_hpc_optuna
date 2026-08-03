@@ -1,0 +1,40 @@
+{
+    "strategy": {
+        "trial": 2414,
+        "score": 19.90954681170388,
+        "file": "reports/paper_strategy_flow.json"
+    },
+    "generated_at": "2026-08-03T17:51:49.485675+00:00",
+    "elapsed_seconds": 9490.0,
+    "final": false,
+    "stream": {
+        "events_seen": 2289095,
+        "trade_events": 1088548,
+        "bytes_seen": 2702602042,
+        "connected": true
+    },
+    "portfolio": {
+        "initial_balance": 10.0,
+        "balance": 9.770936,
+        "equity": 10.001558,
+        "open_positions": 1,
+        "entries": 25,
+        "missed_entries": 0
+    },
+    "metrics": {
+        "trades": 24,
+        "wins": 20,
+        "losses": 4,
+        "win_rate": 0.8333,
+        "gross_profit": 0.027471,
+        "gross_loss": 0.00866,
+        "profit_factor": 3.1722,
+        "total_pnl": 0.018811,
+        "avg_roi": 0.0034,
+        "avg_hold_seconds": 141.16666666666666,
+        "max_drawdown": 0.023762,
+        "exit_reasons": {
+            "TTL": 24
+        }
+    }
+}

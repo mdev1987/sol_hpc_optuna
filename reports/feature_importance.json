@@ -1,0 +1,190 @@
+[
+  {
+    "feature": "liquidity",
+    "importance": 0.105417
+  },
+  {
+    "feature": "liquidity_high",
+    "importance": 0.072588
+  },
+  {
+    "feature": "liquidity_low",
+    "importance": 0.067952
+  },
+  {
+    "feature": "avg_trade",
+    "importance": 0.058817
+  },
+  {
+    "feature": "market_cap",
+    "importance": 0.057552
+  },
+  {
+    "feature": "liquidity_first",
+    "importance": 0.053974
+  },
+  {
+    "feature": "largest_sell",
+    "importance": 0.05189
+  },
+  {
+    "feature": "age_seconds",
+    "importance": 0.051768
+  },
+  {
+    "feature": "liquidity_change",
+    "importance": 0.040269
+  },
+  {
+    "feature": "largest_buy",
+    "importance": 0.034681
+  },
+  {
+    "feature": "trade_velocity",
+    "importance": 0.030329
+  },
+  {
+    "feature": "wallet_velocity",
+    "importance": 0.026431
+  },
+  {
+    "feature": "buys",
+    "importance": 0.025977
+  },
+  {
+    "feature": "price_high",
+    "importance": 0.025598
+  },
+  {
+    "feature": "sell_ratio",
+    "importance": 0.02405
+  },
+  {
+    "feature": "volume",
+    "importance": 0.022925
+  },
+  {
+    "feature": "sell_volume",
+    "importance": 0.020544
+  },
+  {
+    "feature": "unique_wallets",
+    "importance": 0.020462
+  },
+  {
+    "feature": "buy_ratio",
+    "importance": 0.018655
+  },
+  {
+    "feature": "trades",
+    "importance": 0.017803
+  },
+  {
+    "feature": "liquidity_change_50",
+    "importance": 0.017203
+  },
+  {
+    "feature": "liquidity_change_20",
+    "importance": 0.016314
+  },
+  {
+    "feature": "buy_volume",
+    "importance": 0.015001
+  },
+  {
+    "feature": "vwap",
+    "importance": 0.014642
+  },
+  {
+    "feature": "sells",
+    "importance": 0.010497
+  },
+  {
+    "feature": "ema100",
+    "importance": 0.00974
+  },
+  {
+    "feature": "liquidity_velocity",
+    "importance": 0.009727
+  },
+  {
+    "feature": "rsi",
+    "importance": 0.007635
+  },
+  {
+    "feature": "price_change_50",
+    "importance": 0.007268
+  },
+  {
+    "feature": "price_first",
+    "importance": 0.006387
+  },
+  {
+    "feature": "macd_line",
+    "importance": 0.006119
+  },
+  {
+    "feature": "roc_20",
+    "importance": 0.005898
+  },
+  {
+    "feature": "macd_hist",
+    "importance": 0.005853
+  },
+  {
+    "feature": "price_change_20",
+    "importance": 0.005264
+  },
+  {
+    "feature": "liquidity_change_5",
+    "importance": 0.004422
+  },
+  {
+    "feature": "price_change_100",
+    "importance": 0.00413
+  },
+  {
+    "feature": "price",
+    "importance": 0.003663
+  },
+  {
+    "feature": "price_low",
+    "importance": 0.003279
+  },
+  {
+    "feature": "ema5",
+    "importance": 0.003238
+  },
+  {
+    "feature": "ema50",
+    "importance": 0.003156
+  },
+  {
+    "feature": "price_change",
+    "importance": 0.00283
+  },
+  {
+    "feature": "macd_signal",
+    "importance": 0.002795
+  },
+  {
+    "feature": "ema20",
+    "importance": 0.002567
+  },
+  {
+    "feature": "price_change_5",
+    "importance": 0.001805
+  },
+  {
+    "feature": "volume_velocity",
+    "importance": 0.001632
+  },
+  {
+    "feature": "wallet_events",
+    "importance": 0.000846
+  },
+  {
+    "feature": "price_velocity",
+    "importance": 0.000404
+  }
+]
