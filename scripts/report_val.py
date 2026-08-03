@@ -24,6 +24,11 @@ import sys
 import time
 from pathlib import Path
 
+# Allow running as a plain file (uv run python scripts/report_val.py): ensure
+# the repo root (parent of scripts/) is importable so feature_bundles and
+# optuna_engine resolve.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import optuna
 
 from feature_bundles import BUNDLES
