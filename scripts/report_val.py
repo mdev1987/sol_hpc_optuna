@@ -165,6 +165,8 @@ def main() -> int:
         "trial": t.number,
         "parameters": dict(t.params),
         "metrics": metrics,
+        "features": features,
+        "scaler": {f: dataset.scaler[f] for f in features if f in dataset.scaler},
     }
     out_path = save_dir / f"best_strategy_{args.bundle}.json"
     out_path.write_text(json.dumps(output, indent=4))

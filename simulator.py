@@ -308,6 +308,9 @@ class Simulator:
         self.strategy = strategy
         self.portfolio = Portfolio(config)
         self.risk = RiskManager(config)
+        # Entries the strategy wanted but the portfolio rejected (capacity or
+        # balance). Exposed for live paper-trading telemetry.
+        self.missed_entries = 0
 
     def _update_positions(self, snapshot: FeatureSnapshot) -> None:
         if not self.portfolio.positions:
@@ -326,7 +329,8 @@ class Simulator:
             return
         if not self.strategy.should_enter(snapshot):
             return
-        self.portfolio.open_position(snapshot)
+        if not self.portfolio.open_position(snapshot):
+            self.missed_entries += 1
 
     def _update_row(self, snapshot: FeatureSnapshot) -> None:
         self._update_positions(snapshot)
@@ -416,6 +420,20 @@ class Simulator:
             if eligible[i]:
                 self._update_entries(make_snapshot(i))
 
+        return self._close_all(last_price, last_time)
+
+    def step(self, snapshot: FeatureSnapshot) -> None:
+        """Advance the simulation by one live/replay snapshot.
+
+        Exits are evaluated before entries, matching ``run`` exactly, so the
+        live paper-trading bot replicates the backtest row walk one event at a
+        time instead of buffering the whole stream.
+        """
+        self._update_row(snapshot)
+
+    def finish(self, last_price: dict, last_time: dict) -> SimulationResult:
+        """Close any still-open positions at the last seen price and return
+        the final result. Used on shutdown by live paper-trading."""
         return self._close_all(last_price, last_time)
 
     def _close_all(self, last_price: dict, last_time: dict) -> SimulationResult:
