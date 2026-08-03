@@ -34,6 +34,11 @@
 #                       root/passwordless sudo; if it fails the VPS stays on
 #                       and the error is logged.
 #   EXTRA_RCLONE_FLAGS  extra flags passed to rclone (e.g. --drive-chunk-size 128M)
+#   STALL_MINUTES       kill the run if no new COMPLETE trial for this many
+#                       minutes and upload whatever exists (default 45). This
+#                       is the last-resort watchdog: even if a pathological
+#                       trial hangs the optimizer, the VPS still uploads and
+#                       powers off instead of waiting forever.
 #
 # Examples:
 #   ./scripts/run_final_and_upload.sh
@@ -160,7 +165,13 @@ uv run python hpc_replay.py optimize \
     >> "${LOG}" 2>&1 &
 RUN_PID=$!
 
+# Watchdog: if the COMPLETE trial count stops advancing for STALL_MINUTES
+# (e.g. a pathological parameter set hangs a worker despite the in-code per-
+# trial timeout), kill the run and fall through to the upload/shutdown path
+# instead of waiting forever on an unattended VPS.
+STALL_MINUTES="${STALL_MINUTES:-45}"
 last="-1"
+last_change="$(date +%s)"
 while kill -0 "${RUN_PID}" 2>/dev/null; do
     sleep 60
     count="$(_count_complete)"
@@ -168,6 +179,17 @@ while kill -0 "${RUN_PID}" 2>/dev/null; do
         pct=$(( count * 100 / TRIALS ))
         _log "[progress] ${count}/${TRIALS} trials (${pct}%)"
         last="${count}"
+        last_change="$(date +%s)"
+    elif [ $(( $(date +%s) - last_change )) -ge $(( STALL_MINUTES * 60 )) ]; then
+        _log "WARNING: no new complete trial for ${STALL_MINUTES}m; killing run (${count}/${TRIALS})."
+        kill "${RUN_PID}" 2>/dev/null || true
+        for _ in 1 2 3 4 5; do
+            sleep 2
+            kill -0 "${RUN_PID}" 2>/dev/null || break
+        done
+        kill -9 "${RUN_PID}" 2>/dev/null || true
+        sleep 2
+        break
     fi
 done
 rc=0

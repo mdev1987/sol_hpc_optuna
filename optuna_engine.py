@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import multiprocessing
 import os
 import time
 from dataclasses import dataclass
@@ -358,9 +359,28 @@ class Objective:
         only collects the result — worker processes never touch storage.
         """
         if self.pool is not None:
-            score, metrics = self.pool.apply(
+            async_result = self.pool.apply_async(
                 _compute_score, (sim_config, strategy_config)
             )
+            try:
+                score, metrics = async_result.get(timeout=TRIAL_TIMEOUT_SECONDS)
+            except multiprocessing.TimeoutError:
+                # A pathological parameter set stalled a worker past the cap.
+                # Score the trial as rejected so the study (and the unattended
+                # run) always terminates; the worker is left to finish but no
+                # longer blocks the parent. Also prune the trial so TPE does
+                # not keep re-sampling around the stuck region.
+                print(
+                    f"  [bold yellow]trial {trial.number} exceeded "
+                    f"{TRIAL_TIMEOUT_SECONDS}s; scored as rejected[/]",
+                    flush=True,
+                )
+                score, metrics = _rejected(0), {
+                    "profit_factor": 0.0,
+                    "win_rate": 0.0,
+                    "drawdown": 0.0,
+                    "trades": 0,
+                }
         else:
             simulator = Simulator(sim_config, WeightedStrategy(strategy_config))
             result = simulator.run(self.dataset.snapshots())
@@ -394,6 +414,13 @@ ROI_CAP = 3.0
 # window and then fail on the (smaller) validation holdout. Requiring enough
 # trades pushes the search toward strategies that generalize.
 MIN_TRAIN_TRADES = 150
+# Hard cap on a single trial's wall-clock time. A pathological parameter set
+# (very permissive eligibility, high max_positions, loose exits) can send the
+# array-backed simulator into a crawl that lasts hours; with no timeout a
+# single such trial stalls the whole unattended run at ~100% and blocks the
+# upload/shutdown wrapper forever. Trials exceeding this are scored as
+# rejected so the study (and the run) always terminates.
+TRIAL_TIMEOUT_SECONDS = 20 * 60
 
 
 def _min_trades_for(dataset, on_validation: bool) -> int:
@@ -651,7 +678,12 @@ class Optimizer:
                 f"Completed trials persist in the study; re-run to resume."
             ) from e
         finally:
-            pool.close()
+            # Never block on a worker that may be crawling on a pathological
+            # trial: terminate frees the pool immediately (results are already
+            # recorded via trial.user_attrs in the parent), then join reaps the
+            # workers. Without this a stuck worker hangs `study.optimize`'s
+            # thread teardown forever and the unattended wrapper never uploads.
+            pool.terminate()
             pool.join()
 
         done = self._num_complete()
