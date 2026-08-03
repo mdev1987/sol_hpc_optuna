@@ -17,3 +17,4 @@ models/
 
 uv.lock
 download_links.txt
+sol_optuna_results/

@@ -130,7 +130,7 @@ def main() -> int:
               f"{val_m['trades']:9d} {val_m['drawdown']:8.3f} "
               f"{val_m.get('avg_roi', 0.0):9.3f}{ok}", flush=True)
         if winner is None and val_m["trades"] >= floor:
-            winner = (t, val_score, val_metrics, train_score, train_metrics)
+            winner = (t, val_score, val_m, train_score, train_m)
 
     print()
     if winner is None:
