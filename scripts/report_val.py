@@ -118,11 +118,14 @@ def main() -> int:
     print("-" * len(header))
 
     rows = []
-    for t in ranked:
+    for i, t in enumerate(ranked, 1):
+        print(f"  [{i}/{len(ranked)}] evaluating trial {t.number} ...", flush=True)
         params = dict(t.params)
         val_score, val_metrics = evaluate_params(params, dataset, features, on_validation=True)
         train_score, train_metrics = evaluate_params(params, dataset, features, on_validation=False)
         rows.append((t, val_score, val_metrics, train_score, train_metrics))
+        print(f"      -> val_score {val_score:.3f} val_trades {val_metrics['trades']}",
+              flush=True)
 
     rows.sort(key=lambda r: (r[1], -r[2].get("drawdown", 0.0)), reverse=True)
 
