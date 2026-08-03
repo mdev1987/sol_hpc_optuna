@@ -19,6 +19,9 @@ dependencies = [
     "pydantic>=2.11",
     "tenacity>=9",
     "websockets>=17.0.1",
+    "python-telegram-bot>=22.8",
+    "python-dotenv>=1.2.2",
+    "telegramify-markdown>=1.2.0",
 ]
 
 [project.scripts]

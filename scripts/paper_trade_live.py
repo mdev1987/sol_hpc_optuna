@@ -39,12 +39,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import orjson
 import websockets
 
-from feature_engine import FeatureEngine
+from feature_engine import FeatureEngine, FeatureSnapshot
 from optuna_engine import _strategy_from_params
 from parser import EventParser
+from reporter import TelegramNotifier
 from simulator import Simulator, WeightedStrategy
 
 DEFAULT_URI = "wss://stream.pumpapi.io/"
+
+# Trade ExitReason -> reporter.py alert keys.
+_REASON_MAP = {
+    "STOP_LOSS": "sl",
+    "TAKE_PROFIT": "tp",
+    "TRAILING_STOP": "trailing",
+    "TTL": "ttl",
+    "MANUAL": "dead",
+}
 
 
 class PaperTrader:
@@ -57,13 +67,15 @@ class PaperTrader:
         initial_balance: float,
         summary_every: float,
         prune_after: float,
+        telegram_enabled: bool,
     ):
         features = strategy["features"]
         scaler = strategy["scaler"]
-        sim_config, strategy_config = _strategy_from_params(
+        strategy_config, sim_config = _strategy_from_params(
             strategy["parameters"], features, scaler
         )
         sim_config.initial_balance = initial_balance
+        self.strategy = strategy
         self.strategy_meta = {
             "trial": strategy.get("trial"),
             "score": strategy.get("score"),
@@ -90,8 +102,93 @@ class PaperTrader:
         self._stop = False
         self._finalized = False
 
+        self.notifier = TelegramNotifier() if telegram_enabled else None
+        self.entry_scores: dict[str, float] = {}
+
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
         self.report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ---------------------------------------------------------------
+    # Telegram notifications
+    # ---------------------------------------------------------------
+
+    def _spawn(self, coro) -> None:
+        if self.notifier is None:
+            return
+        try:
+            asyncio.create_task(coro)
+        except RuntimeError:
+            pass
+
+    def _on_entry(self, snapshot: FeatureSnapshot) -> None:
+        if self.notifier is None:
+            return
+        f = snapshot.features
+        score = float(self.sim.strategy.score(snapshot))
+        self.entry_scores[snapshot.mint] = score
+        self._spawn(
+            self.notifier.send_buy(
+                mint=snapshot.mint,
+                price=f.get("price", 0.0),
+                score=score,
+                wallets=f.get("unique_wallets", 0),
+                volume=f.get("volume", 0.0),
+                buy_ratio=f.get("buy_ratio", 0.0),
+                age_ms=int(f.get("age_seconds", 0)) * 1000,
+                activity=f.get("trade_velocity", 0.0),
+                balance=self.sim.portfolio.balance,
+            )
+        )
+
+    def _on_trade_closed(self, trade) -> None:
+        if self.notifier is None:
+            return
+        score = self.entry_scores.get(trade.mint, 0.0)
+        self._spawn(
+            self.notifier.send_sell(
+                mint=trade.mint,
+                entry_price=trade.entry_price,
+                exit_price=trade.exit_price,
+                pnl=trade.pnl,
+                pnl_pct=trade.roi,
+                hold_sec=trade.exit_time - trade.entry_time,
+                exit_reason=_REASON_MAP.get(trade.reason.value, "dead"),
+                score=score,
+                balance=self.sim.portfolio.balance,
+            )
+        )
+
+    def _send_telegram_summary(self) -> None:
+        if self.notifier is None:
+            return
+        s = self._summary(final=False)
+        m = s["metrics"]
+        self._spawn(
+            self.notifier.send_summary(
+                runtime_s=s["elapsed_seconds"],
+                trades=m["trades"],
+                win_rate=m["win_rate"] * 100,
+                pnl=m["total_pnl"],
+                pf=m["profit_factor"],
+                balance=self.sim.portfolio.balance,
+                exit_counts=m["exit_reasons"],
+            )
+        )
+
+    def _send_telegram_stopped(self) -> None:
+        if self.notifier is None:
+            return
+        s = self._summary(final=True)
+        m = s["metrics"]
+        self._spawn(
+            self.notifier.send_stopped(
+                runtime_s=s["elapsed_seconds"],
+                trades=m["trades"],
+                win_rate=m["win_rate"] * 100,
+                pnl=m["total_pnl"],
+                msgs=self.notifier._sent_count,
+            )
+        )
 
     # ---------------------------------------------------------------
     # Signal handling
@@ -122,7 +219,14 @@ class PaperTrader:
         self.last_price[snapshot.mint] = snapshot.features["price"]
         self.last_time[snapshot.mint] = snapshot.timestamp
         self.last_seen[snapshot.mint] = snapshot.timestamp
+        was_open = self.sim.portfolio.has_position(snapshot.mint)
+        closed_before = len(self.sim.portfolio.closed)
         self.sim.step(snapshot)
+        if len(self.sim.portfolio.closed) > closed_before:
+            for trade in self.sim.portfolio.closed[closed_before:]:
+                self._on_trade_closed(trade)
+        if not was_open and self.sim.portfolio.has_position(snapshot.mint):
+            self._on_entry(snapshot)
 
     def _log_closed(self) -> None:
         closed = self.sim.portfolio.closed
@@ -285,10 +389,21 @@ class PaperTrader:
                 self._log_closed()
                 self.write_report(final=False)
                 self.print_summary(final=False)
+                self._send_telegram_summary()
                 self._prune_stale()
                 self.last_summary_ts = now
 
     async def run(self) -> int:
+        if self.notifier is not None:
+            print("[paper] telegram notifications enabled", flush=True)
+            self._spawn(
+                self.notifier.send_startup(
+                    f"Trial `{self.strategy_meta['trial']}` | "
+                    f"{len(self.strategy['features'])} features | "
+                    f"balance `{self.sim.config.initial_balance:.2f} SOL` | "
+                    f"summary every `{self.summary_every:.0f}s`"
+                )
+            )
         uri = DEFAULT_URI
         backoff = 1.0
         while not self._stop:
@@ -312,6 +427,7 @@ class PaperTrader:
         self._finalized = True
         self.write_report(final=True)
         self.print_summary(final=True)
+        self._send_telegram_stopped()
         print(
             f"[paper] final balance {result.final_balance:.6f} "
             f"(return {result.total_return:.2%}) over {result.trades} trades",
@@ -334,6 +450,9 @@ def main() -> int:
     ap.add_argument("--prune-after", type=float, default=7200.0,
                     help="drop per-token state after N seconds of inactivity "
                          "(0 disables)")
+    ap.add_argument("--no-telegram", action="store_true",
+                    help="disable Telegram alerts (uses BOT_TOKEN/CHAT_ID from "
+                         ".env when not set)")
     args = ap.parse_args()
 
     strategy_path = Path(args.strategy)
@@ -356,6 +475,7 @@ def main() -> int:
         initial_balance=args.initial_balance,
         summary_every=args.summary_every,
         prune_after=args.prune_after,
+        telegram_enabled=not args.no_telegram,
     )
     print(
         f"[paper] trial {strategy.get('trial')} | "
