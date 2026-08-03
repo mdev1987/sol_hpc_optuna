@@ -8,6 +8,8 @@ __pycache__/
 .idea/
 .vscode/
 
+.env
+
 downloads/
 cache/
 parquet/
@@ -18,3 +20,5 @@ models/
 uv.lock
 download_links.txt
 sol_optuna_results/
+.ruff_cache/
+.pytest_cache/
