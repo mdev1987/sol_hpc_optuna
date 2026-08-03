@@ -217,30 +217,42 @@ def upload_back(status: str, rc: int) -> bool:
                   f"{DB}, {REPORT_DIR}, {LOG_DIR}", flush=True)
             return True
 
-    assets = [str(DB), str(REPORT_DIR), str(status_file), str(LOG_DIR / f"final_run_{BUNDLE}.log")]
+    # rclone accepts a single source per `copy` reliably, so each file is
+    # uploaded with its own command and verified individually.
+    pairs = []
+    pairs.append((str(DB), DB.name))
+    pairs.append((str(status_file), f"final_status_{BUNDLE}.txt"))
+    pairs.append((str(LOG_DIR / f"final_run_{BUNDLE}.log"), f"final_run_{BUNDLE}.log"))
+    report = REPORT_DIR / f"best_strategy_{BUNDLE}.json"
+    if report.exists():
+        pairs.append((str(report), report.name))
+    summary = REPORT_DIR / f"final_summary_{BUNDLE}.txt"
+    if summary.exists():
+        pairs.append((str(summary), summary.name))
     selected = CACHE / "selected_features.json"
     if selected.exists():
-        assets.append(str(selected))
+        pairs.append((str(selected), selected.name))
+    if not pairs:
+        print("nothing to upload", flush=True)
+        return False
     ok = False
     for attempt in range(1, 6):
         print(f"upload attempt {attempt}/5 -> {DEST}", flush=True)
-        try:
-            sh("rclone copy --progress " + " ".join(f"'{a}'" for a in assets) + f" '{DEST}'")
-        except subprocess.CalledProcessError:
-            time.sleep(30)
-            continue
-        listed = sh(f"rclone lsf {DEST}", capture_output=True).stdout
-        expect = [DB.name, f"final_status_{BUNDLE}.txt", f"final_run_{BUNDLE}.log"]
-        if (REPORT_DIR / f"best_strategy_{BUNDLE}.json").exists():
-            expect.append(f"best_strategy_{BUNDLE}.json")
-        if (REPORT_DIR / f"final_summary_{BUNDLE}.txt").exists():
-            expect.append(f"final_summary_{BUNDLE}.txt")
-        if selected.exists():
-            expect.append("selected_features.json")
-        if all(e in listed for e in expect):
+        failed = False
+        for src, name in pairs:
+            print(f"  uploading {name}", flush=True)
+            try:
+                sh(f"rclone copy '{src}' '{DEST}'")
+            except subprocess.CalledProcessError:
+                failed = True
+                continue
+            listed = sh(f"rclone lsf {DEST}", capture_output=True).stdout
+            if name not in listed.split():
+                failed = True
+        if not failed:
             ok = True
             break
-        print("files missing on remote, retrying...", flush=True)
+        print("some files missing on remote, retrying...", flush=True)
         time.sleep(30)
     print(f"upload {'verified' if ok else 'FAILED after 5 attempts'} -> {DEST}", flush=True)
     return ok

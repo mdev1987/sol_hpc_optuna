@@ -220,36 +220,52 @@ fi
 _log "status file written: ${STATUS}"
 
 # --- Upload (always, retried, verified) -------------------------------------
+# rclone accepts a single source per `copy` invocation reliably (batched
+# sources/dirs can error), so each file is uploaded with its own command and
+# verified individually.
 
-ASSETS=("${DB}")
-[ -f "${DB}-wal" ] && ASSETS+=("${DB}-wal")
-[ -f "${DB}-shm" ] && ASSETS+=("${DB}-shm")
-ASSETS+=("${REPORT_DIR}" "${STATUS}" "${LOG}")
+# Build an explicit list of "<local path> <remote name>" pairs.
+declare -a PAIRS=()
+_add() { # $1 local-path  $2 remote-name
+    [ -f "$1" ] && PAIRS+=("$1|$2")
+}
+_add "${DB}" "$(basename "${DB}")"
+[ -f "${DB}-wal" ] && _add "${DB}-wal" "$(basename "${DB}-wal")"
+[ -f "${DB}-shm" ] && _add "${DB}-shm" "$(basename "${DB}-shm")"
+_add "${STATUS}" "final_status_${BUNDLE}.txt"
+_add "${LOG}" "final_run_${BUNDLE}.log"
+_add "${REPORT}" "best_strategy_${BUNDLE}.json"
+_add "${SUMMARY}" "final_summary_${BUNDLE}.txt"
+_add "${ROOT}/cache/selected_features.json" "selected_features.json"
 
-EXPECT=("$(basename "${DB}")" "final_status_${BUNDLE}.txt" "final_run_${BUNDLE}.log")
-[ -f "${REPORT}" ] && EXPECT+=("best_strategy_${BUNDLE}.json")
-[ -f "${SUMMARY}" ] && EXPECT+=("final_summary_${BUNDLE}.txt")
-if [ -f "${ROOT}/cache/selected_features.json" ]; then
-    ASSETS+=("${ROOT}/cache/selected_features.json")
-    EXPECT+=("selected_features.json")
+if [ "${#PAIRS[@]}" = "0" ]; then
+    _log "ERROR: nothing to upload."
+elif [ "${#PAIRS[@]}" -gt 100 ]; then
+    _log "ERROR: upload list seems malformed (${#PAIRS[@]} entries)."
 fi
 
 uploaded=0
 for attempt in 1 2 3 4 5; do
-    _log "upload attempt ${attempt}/5 -> ${RCLONE_DEST} ..."
-    if rclone copy --progress ${EXTRA_RCLONE_FLAGS:-} "${ASSETS[@]}" "${RCLONE_DEST}" 2>&1 | tail -5; then
-        missing=0
-        for f in "${EXPECT[@]}"; do
-            if ! rclone lsf "${RCLONE_DEST}" 2>/dev/null | grep -qx "${f}"; then
-                missing=1
-            fi
-        done
-        if [ "${missing}" = "0" ]; then
-            uploaded=1
-            break
+    failed=0
+    for pair in "${PAIRS[@]}"; do
+        src="${pair%%|*}"
+        name="${pair#*|}"
+        _log "  upload attempt ${attempt}/5: ${name}"
+        if ! rclone copy --progress ${EXTRA_RCLONE_FLAGS:-} "${src}" "${RCLONE_DEST}" >/dev/null 2>&1; then
+            _log "  ...rclone returned an error for ${name}"
+            failed=1
+            continue
         fi
-        _log "warning: files missing on remote, retrying..."
+        if ! rclone lsf "${RCLONE_DEST}" 2>/dev/null | grep -qx "${name}"; then
+            _log "  ...${name} not verified on remote"
+            failed=1
+        fi
+    done
+    if [ "${failed}" = "0" ]; then
+        uploaded=1
+        break
     fi
+    _log "warning: some files failed, retrying..."
     sleep 30
 done
 
@@ -257,7 +273,10 @@ if [ "${uploaded}" = "1" ]; then
     _log "upload verified: all files present at ${RCLONE_DEST}"
 else
     _log "ERROR: upload failed after 5 attempts."
-    _log "  run manually: rclone copy --progress ${ASSETS[*]} ${RCLONE_DEST}"
+    _log "  run manually, one file at a time, e.g.:"
+    for pair in "${PAIRS[@]}"; do
+        _log "    rclone copy ${pair%%|*} ${RCLONE_DEST}"
+    done
 fi
 
 _log "=== done $(date '+%Y-%m-%d %H:%M:%S') ==="
