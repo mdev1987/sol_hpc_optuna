@@ -86,9 +86,25 @@ class SnapshotDataset:
     ):
         import polars as pl
 
-        self.frame = pl.read_parquet(path)
         self.ignore = {"mint", "timestamp", "slot"}
-        self.feature_columns = [c for c in self.frame.columns if c not in self.ignore]
+        # Working column set: everything `should_enter` reads plus the weighted
+        # bundle features. Shrinks the per-row FeatureSnapshot dict (the
+        # ~4.9s/1M cost) and lets us read only those columns from disk.
+        all_cols = list(pl.scan_parquet(path).collect_schema().names())
+        self.feature_columns = [c for c in all_cols if c not in self.ignore]
+        if columns is None:
+            self.work_columns = list(self.feature_columns)
+        else:
+            wanted = set(columns) | _THRESHOLD_COLUMNS
+            self.work_columns = [c for c in self.feature_columns if c in wanted]
+        self._work_index = {c: j for j, c in enumerate(self.work_columns)}
+
+        # Read only the columns we actually use (work columns + id columns),
+        # instead of the full ~50-column frame. On the 62GB VPS this alone is
+        # the difference between a shared ~8GB dataset and a 2-3x larger one;
+        # on a 15GB machine it makes local validation feasible at all.
+        needed = [*self.ignore, *self.work_columns]
+        self.frame = pl.scan_parquet(path).select(needed).collect()
 
         # Sub-sample whole mints (never individual events) so per-mint price
         # paths stay intact for the simulator's exit logic. This shrinks both
@@ -113,16 +129,6 @@ class SnapshotDataset:
             cutoff = np.quantile(np.sort(self._timestamps), 1.0 - self.validation_fraction)
             self._val_mask = self._timestamps > cutoff
             self._train_mask = ~self._val_mask
-
-        # Working column set: everything `should_enter` reads plus the weighted
-        # bundle features. Shrinks the per-row FeatureSnapshot dict (the
-        # ~4.9s/1M cost) without changing any evaluated feature.
-        if columns is None:
-            self.work_columns = list(self.feature_columns)
-        else:
-            wanted = set(columns) | _THRESHOLD_COLUMNS
-            self.work_columns = [c for c in self.feature_columns if c in wanted]
-        self._work_index = {c: j for j, c in enumerate(self.work_columns)}
 
         # Build ONLY the reduced working matrix -- never the all-features
         # `full` copy. Drop the polars frame as soon as it has been converted
