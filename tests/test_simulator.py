@@ -45,6 +45,59 @@ def test_open_positions_close_at_last_market_price():
     assert trade.exit_price != trade.entry_price
 
 
+def test_cooldown_blocks_reentry_then_allows():
+    config = SimulatorConfig(cooldown_seconds=100, take_profit=0.2, ttl_seconds=10_000)
+    sim = Simulator(config, AlwaysEnter())
+    result = sim.run([
+        _snap("A", 0, 1.0),
+        _snap("A", 10, 1.3),   # +30% -> TAKE_PROFIT close, blocked until 110
+        _snap("A", 20, 1.0),   # within cooldown -> rejected
+        _snap("A", 120, 1.0),  # cooldown expired -> re-enters
+    ])
+
+    # The exit event itself also rejects same-tick re-entry.
+    assert sim.cooldown_rejects == 2
+    assert result.trades == 2
+    assert result.closed_trades[0].reason == ExitReason.TAKE_PROFIT
+
+
+def test_cooldown_once_never_reenters():
+    config = SimulatorConfig(cooldown_seconds=-1, take_profit=0.2, ttl_seconds=10_000)
+    sim = Simulator(config, AlwaysEnter())
+    result = sim.run([
+        _snap("A", 0, 1.0),
+        _snap("A", 10, 1.3),   # TAKE_PROFIT close, blocked forever
+        _snap("A", 20, 1.0),
+        _snap("A", 30, 1.0),
+        _snap("A", 40, 1.0),
+    ])
+
+    assert sim.cooldown_rejects == 4
+    assert result.trades == 1
+
+
+def test_zero_cooldown_allows_immediate_reentry():
+    config = SimulatorConfig(cooldown_seconds=0, stop_loss=0.5, take_profit=0.2, ttl_seconds=10_000)
+    sim = Simulator(config, AlwaysEnter())
+    result = sim.run([
+        _snap("A", 0, 1.0),
+        _snap("A", 10, 1.3),   # TAKE_PROFIT close
+        _snap("A", 20, 1.0),   # no cooldown -> re-enters, still held at finish
+    ])
+
+    assert sim.cooldown_rejects == 0
+    assert result.trades == 2
+
+
+def test_strategy_from_params_wires_cooldown():
+    from optuna_engine import _strategy_from_params
+
+    _, sim_config = _strategy_from_params(
+        {"cooldown_seconds": 300, "position_size": 0.2}, [], {}
+    )
+    assert sim_config.cooldown_seconds == 300.0
+
+
 def test_score_uses_standardized_values():
     cfg = StrategyConfig(weights={"a": 1.0}, scaler={"a": (10.0, 1.0)})
     strategy = WeightedStrategy(cfg)

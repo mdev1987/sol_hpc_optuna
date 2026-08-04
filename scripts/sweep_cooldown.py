@@ -18,6 +18,10 @@ Usage:
         --cooldowns 0,180,300,600,once \
         --sample-fraction 1.0 \
         --prune-after 7200
+
+Note: the replay is processed one Python event at a time (mirroring the live
+bot), so a full-day file is ~85 minutes per cooldown config. Use
+``--sample-fraction`` or run overnight / on the HPC box for multi-config runs.
 """
 from __future__ import annotations
 
@@ -81,10 +85,8 @@ def _rows(
 class _ReplayMirror:
     """Faithful offline copy of the live bot's per-event handling."""
 
-    def __init__(self, sim_config, stale_close_seconds: int, prune_after: float):
-        self.sim = Simulator(sim_config, WeightedStrategy(
-            _strategy_from_params(_params(), _features, _scaler)[0]
-        ))
+    def __init__(self, sim_config, strategy_config, stale_close_seconds: int, prune_after: float):
+        self.sim = Simulator(sim_config, WeightedStrategy(strategy_config))
         self.engine = FeatureEngine()
         self.stale_close_seconds = stale_close_seconds
         self.prune_after = prune_after
@@ -169,12 +171,13 @@ def _entry_stats(closed, open_positions) -> dict:
 
 def run_cooldown(
     sim_config,
+    strategy_config,
     rows,
     batch_size: int,
     prune_after: float,
 ) -> dict:
     stale_close_seconds = max(300, 5 * int(sim_config.ttl_seconds))
-    mirror = _ReplayMirror(sim_config, stale_close_seconds, prune_after)
+    mirror = _ReplayMirror(sim_config, strategy_config, stale_close_seconds, prune_after)
 
     start = time.time()
     n = 0
@@ -236,15 +239,10 @@ def main() -> int:
         if key not in strategy:
             sys.exit(f"strategy file {strategy_path} is missing '{key}'")
 
-    global _params, _features, _scaler
-    _params, _features, _scaler = (
-        strategy["parameters"], strategy["features"], strategy["scaler"],
-    )
     strategy_config, base_sim = _strategy_from_params(
-        _params, _features, _scaler
+        strategy["parameters"], strategy["features"], strategy["scaler"]
     )
     base_sim.initial_balance = args.initial_balance
-
     allowed_mints = None
     if args.sample_fraction < 1.0:
         mints = (
@@ -272,7 +270,7 @@ def main() -> int:
         sim_config = SimulatorConfigProxy(base_sim, cooldown)
         rows = _rows(Path(args.parquet), args.batch_size, allowed_mints)
         print(f"[sweep] cooldown={_label(cooldown)} ...", flush=True)
-        res = run_cooldown(sim_config, rows, args.batch_size, args.prune_after)
+        res = run_cooldown(sim_config, strategy_config, rows, args.batch_size, args.prune_after)
         res["cooldown"] = _label(cooldown)
         results.append(res)
         print(f"[sweep]   done in {res['seconds']}s "
@@ -300,21 +298,14 @@ def main() -> int:
 
 
 class SimulatorConfigProxy:
-    """A tiny mutable proxy so each cooldown config shares baseline settings."""
+    """Forward baseline simulator settings, overriding only the cooldown."""
 
     def __init__(self, base, cooldown: float):
-        import dataclasses
-
         self._base = base
         self.cooldown_seconds = cooldown
 
     def __getattr__(self, name):
         return getattr(self._base, name)
-
-    def copy(self):
-        import dataclasses
-
-        return dataclasses.replace(self._base, cooldown_seconds=self.cooldown_seconds)
 
 
 if __name__ == "__main__":
