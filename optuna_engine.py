@@ -535,6 +535,7 @@ def _strategy_from_params(
         trailing_stop=float(params.get("trailing_stop", 0.20)),
         ttl_seconds=int(params.get("ttl_seconds", 300)),
         max_positions=int(params.get("max_positions", 3)),
+        cooldown_seconds=float(params.get("cooldown_seconds", 0.0)),
     )
     return strategy_config, simulator_config
 

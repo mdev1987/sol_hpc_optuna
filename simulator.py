@@ -34,6 +34,9 @@ class SimulatorConfig:
     trailing_stop: float = 0.20
     ttl_seconds: int = 300
     max_drawdown: float = 0.30
+    # Seconds a mint must wait after a position closes before it can be
+    # re-entered. -1 (or any negative value) means one-trade-per-mint.
+    cooldown_seconds: float = 0.0
 
 
 @dataclass(slots=True)
@@ -84,6 +87,9 @@ class Portfolio:
         self.closed: list[Trade] = []
         self.stats = Statistics()
         self.stats.max_balance = self.balance
+        # Timestamp (mint -> int) after which the mint may be re-entered.
+        self.entry_blocked_until: dict[str, int] = {}
+        self._cooldown = config.cooldown_seconds
 
     @property
     def equity(self) -> float:
@@ -91,6 +97,10 @@ class Portfolio:
 
     def has_position(self, mint: str) -> bool:
         return mint in self.positions
+
+    def is_cooldown(self, mint: str, timestamp: int) -> bool:
+        blocked_until = self.entry_blocked_until.get(mint)
+        return blocked_until is not None and timestamp < blocked_until
 
     def position_count(self) -> int:
         return len(self.positions)
@@ -153,6 +163,12 @@ class Portfolio:
         self.balance += received
         self.stats.trades += 1
         self.stats.total_pnl += pnl
+
+        if self._cooldown != 0:
+            if self._cooldown < 0:
+                self.entry_blocked_until[mint] = 2**63 - 1
+            else:
+                self.entry_blocked_until[mint] = int(timestamp + self._cooldown)
 
         if pnl >= 0:
             self.stats.wins += 1
@@ -312,6 +328,8 @@ class Simulator:
         # Entries the strategy wanted but the portfolio rejected (capacity or
         # balance). Exposed for live paper-trading telemetry.
         self.missed_entries = 0
+        # Entries the strategy wanted but a per-mint re-entry cooldown rejected.
+        self.cooldown_rejects = 0
 
     def _update_positions(self, snapshot: FeatureSnapshot) -> None:
         if not self.portfolio.positions:
@@ -327,6 +345,9 @@ class Simulator:
 
     def _update_entries(self, snapshot: FeatureSnapshot) -> None:
         if self.portfolio.has_position(snapshot.mint):
+            return
+        if self.portfolio.is_cooldown(snapshot.mint, snapshot.timestamp):
+            self.cooldown_rejects += 1
             return
         if not self.strategy.should_enter(snapshot):
             return

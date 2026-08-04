@@ -11,10 +11,10 @@ from telegram import MessageEntity as TGMessageEntity
 from telegramify_markdown import convert
 
 try:
-    from rugcheck import RUG_EMOJI, RugInfo  # type: ignore[import-not-found]
+    from rugchecks.pumpcoins import RUG_EMOJI, RugInfo  # type: ignore[import-not-found]
 except ImportError:
-    # rugcheck is an optional module from an external project; paper trading
-    # sends alerts without rug scores when it is not installed.
+    # rugchecks is an optional package from the repo; paper trading sends
+    # alerts without rug scores when it is not available.
     class RugInfo:  # type: ignore[no-redef]
         error = None
         verdict = "unknown"
@@ -212,6 +212,9 @@ class TelegramNotifier:
         avg_loss: float | None = None,
         reward_risk: float | None = None,
         expectancy: float | None = None,
+        price_glitches: int | None = None,
+        cooldown_rejects: int | None = None,
+        rug_blocked: int | None = None,
     ):
         runtime_m = runtime_s / 60
         s = _sign(pnl)
@@ -228,6 +231,15 @@ class TelegramNotifier:
                 f"{B} Avg W/L `{avg_win:.4f}/{avg_loss:.4f}` "
                 f"R:R `{reward_risk:.2f}` Exp `{_sign(expectancy)}{abs(expectancy):.5f}`"
             )
+        filters = []
+        if price_glitches:
+            filters.append(f"glitch `{price_glitches}`")
+        if cooldown_rejects:
+            filters.append(f"cooldown `{cooldown_rejects}`")
+        if rug_blocked:
+            filters.append(f"rug_blocked `{rug_blocked}`")
+        if filters:
+            lines.append(f"{B} Filters {' '.join(filters)}")
         lines.append(
             (
                 "\n".join(

@@ -18,7 +18,9 @@ Usage:
         [--report reports/paper_trade_flow.json] \
         [--initial-balance 10.0] \
         [--summary-every 600] \
-        [--prune-after 7200]
+        [--prune-after 7200] \
+        [--cooldown 0] \
+        [--no-rug-check]
 
 Run under tmux/systemd so a dropped SSH session does not kill it.
 """
@@ -44,6 +46,12 @@ from optuna_engine import _strategy_from_params
 from parser import EventParser, ReplayEvent
 from reporter import TelegramNotifier
 from simulator import ExitReason, Simulator, WeightedStrategy
+
+try:
+    from rugchecks.pumpcoins import RugInfo, check as pumpcoins_check
+except ImportError:
+    RugInfo = None
+    pumpcoins_check = None
 
 DEFAULT_URI = "wss://stream.pumpapi.io/"
 
@@ -73,6 +81,8 @@ class PaperTrader:
         initial_balance: float,
         summary_every: float,
         prune_after: float,
+        cooldown_seconds: float,
+        rug_enabled: bool,
         telegram_enabled: bool,
     ):
         features = strategy["features"]
@@ -81,6 +91,8 @@ class PaperTrader:
             strategy["parameters"], features, scaler
         )
         sim_config.initial_balance = initial_balance
+        if cooldown_seconds != 0.0:
+            sim_config.cooldown_seconds = cooldown_seconds
         self.strategy = strategy
         self.strategy_meta = {
             "trial": strategy.get("trial"),
@@ -104,6 +116,15 @@ class PaperTrader:
         self.valid_price: dict[str, float] = {}
         self.last_valid_ts: dict[str, int] = {}
         self.price_glitches = 0
+        # Rug hard-flag filter: mints whose pumpcoins check shows a dangerous
+        # on-chain state (mint/freeze authority live, or unlocked LP on a live
+        # pool) are blocked from entry. Pending/error checks fail open.
+        self.rug_enabled = rug_enabled and pumpcoins_check is not None
+        self.rug_checked: set[str] = set()
+        self.rug_blocked: dict[str, RugInfo] = {}
+        self.rug_checked_blocked: set[str] = set()
+        self.rug_blocked_mints = 0
+        self.rug_verdicts: dict[str, RugInfo] = {}
         self.stale_close_seconds = max(
             300, 5 * int(getattr(sim_config, "ttl_seconds", 60))
         )
@@ -152,6 +173,7 @@ class PaperTrader:
                 age_ms=int(f.get("age_seconds", 0)) * 1000,
                 activity=f.get("trade_velocity", 0.0),
                 balance=self.sim.portfolio.balance,
+                rug=self.rug_verdicts.get(snapshot.mint),
             )
         )
 
@@ -170,6 +192,7 @@ class PaperTrader:
                 exit_reason=_REASON_MAP.get(trade.reason.value, "dead"),
                 score=score,
                 balance=self.sim.portfolio.balance,
+                rug=self.rug_verdicts.get(trade.mint),
             )
         )
 
@@ -191,6 +214,9 @@ class PaperTrader:
                 avg_loss=m["avg_loss"],
                 reward_risk=m["reward_risk"],
                 expectancy=m["expectancy"],
+                price_glitches=s["stream"]["price_glitches"],
+                cooldown_rejects=self.sim.cooldown_rejects,
+                rug_blocked=self.rug_blocked_mints,
             )
         )
 
@@ -272,6 +298,43 @@ class PaperTrader:
             for trade in self.sim.portfolio.closed[closed_before:]:
                 self._on_trade_closed(trade)
 
+    # ---------------------------------------------------------------
+    # Rug hard-flag filter
+    # ---------------------------------------------------------------
+
+    @staticmethod
+    def _rug_hard_blocked(info: RugInfo) -> bool:
+        """Only genuinely dangerous on-chain states block an entry.
+
+        Heuristic verdicts/scores/top-10 concentration are ignored: fresh
+        pump.fun tokens always launch concentrated with little or no pool.
+        """
+        if info.error:
+            return False
+        if not info.mint_revoked:
+            return True
+        if not info.freeze_revoked:
+            return True
+        if info.has_pool and not info.lp_locked:
+            return True
+        return False
+
+    def _spawn_rug_check(self, mint: str) -> None:
+        if mint in self.rug_checked:
+            return
+        self.rug_checked.add(mint)
+        try:
+            asyncio.create_task(self._check_rug(mint))
+        except RuntimeError:
+            pass
+
+    async def _check_rug(self, mint: str) -> None:
+        info = await pumpcoins_check(mint)
+        if not info.error:
+            self.rug_verdicts[mint] = info
+        if self._rug_hard_blocked(info):
+            self.rug_blocked[mint] = info
+
     def _on_raw(self, raw: dict) -> None:
         self.events_seen += 1
         event = EventParser.parse(raw)
@@ -280,6 +343,16 @@ class PaperTrader:
         self.trade_events += 1
         if not self._sanitize(event):
             return
+        if self.rug_enabled:
+            self._spawn_rug_check(event.mint)
+            if (
+                event.mint in self.rug_blocked
+                and not self.sim.portfolio.has_position(event.mint)
+            ):
+                if event.mint not in self.rug_checked_blocked:
+                    self.rug_checked_blocked.add(event.mint)
+                    self.rug_blocked_mints += 1
+                return
         snapshot = self.engine.update(event)
         price = snapshot.features["price"]
         self.last_price[snapshot.mint] = price
@@ -397,6 +470,8 @@ class PaperTrader:
                 "open_positions": p.position_count(),
                 "entries": len(p.closed) + p.position_count(),
                 "missed_entries": self.sim.missed_entries,
+                "cooldown_rejects": self.sim.cooldown_rejects,
+                "rug_blocked_mints": self.rug_blocked_mints,
             },
             "metrics": {
                 "trades": len(trades),
@@ -435,7 +510,9 @@ class PaperTrader:
             f"dd={m['max_drawdown']:.2%} "
             f"equity={s['portfolio']['equity']:.4f} "
             f"open={s['portfolio']['open_positions']} "
-            f"missed={s['portfolio']['missed_entries']}",
+            f"missed={s['portfolio']['missed_entries']} "
+            f"cooldown_rejects={s['portfolio']['cooldown_rejects']} "
+            f"rug_blocked={s['portfolio']['rug_blocked_mints']}",
             flush=True,
         )
 
@@ -533,6 +610,11 @@ def main() -> int:
     ap.add_argument("--prune-after", type=float, default=7200.0,
                     help="drop per-token state after N seconds of inactivity "
                          "(0 disables)")
+    ap.add_argument("--cooldown", default="0",
+                    help="seconds a mint waits after a close before re-entry; "
+                         "'once' = one trade per mint (0 disables)")
+    ap.add_argument("--no-rug-check", action="store_true",
+                    help="disable the pumpcoins hard-flag rug filter")
     ap.add_argument("--no-telegram", action="store_true",
                     help="disable Telegram alerts (uses BOT_TOKEN/CHAT_ID from "
                          ".env when not set)")
@@ -550,6 +632,18 @@ def main() -> int:
         if key not in strategy:
             sys.exit(f"strategy file {strategy_path} is missing '{key}'")
 
+    cooldown = args.cooldown.strip().lower()
+    if cooldown == "once":
+        cooldown_seconds = -1.0
+    else:
+        try:
+            cooldown_seconds = float(cooldown)
+        except ValueError:
+            sys.exit(f"invalid --cooldown value: {args.cooldown} "
+                     "(seconds or 'once')")
+        if cooldown_seconds < 0:
+            sys.exit("--cooldown must be >= 0 seconds or 'once'")
+
     trader = PaperTrader(
         strategy=strategy,
         strategy_path=strategy_path,
@@ -558,13 +652,17 @@ def main() -> int:
         initial_balance=args.initial_balance,
         summary_every=args.summary_every,
         prune_after=args.prune_after,
+        cooldown_seconds=cooldown_seconds,
+        rug_enabled=not args.no_rug_check,
         telegram_enabled=not args.no_telegram,
     )
     print(
         f"[paper] trial {strategy.get('trial')} | "
         f"{len(strategy['features'])} features | "
         f"initial_balance {args.initial_balance} | "
-        f"summary_every {args.summary_every:.0f}s",
+        f"summary_every {args.summary_every:.0f}s | "
+        f"cooldown {args.cooldown} | "
+        f"rug_check {'on' if trader.rug_enabled else 'off'}",
         flush=True,
     )
 
