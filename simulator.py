@@ -18,6 +18,7 @@ class ExitReason(Enum):
     TRAILING_STOP = "TRAILING_STOP"
     TTL = "TTL"
     MANUAL = "MANUAL"
+    PRICE_UNAVAILABLE = "PRICE_UNAVAILABLE"
 
 
 @dataclass(slots=True)

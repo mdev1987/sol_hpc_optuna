@@ -41,11 +41,16 @@ import websockets
 
 from feature_engine import FeatureEngine, FeatureSnapshot
 from optuna_engine import _strategy_from_params
-from parser import EventParser
+from parser import EventParser, ReplayEvent
 from reporter import TelegramNotifier
-from simulator import Simulator, WeightedStrategy
+from simulator import ExitReason, Simulator, WeightedStrategy
 
 DEFAULT_URI = "wss://stream.pumpapi.io/"
+
+# An event price outside a mint's last valid price by more than this factor is
+# treated as a feed glitch (observed: `2.22e-21` vs a `~2e-9` entry price),
+# not a real move. Real pump/rug moves are < 1e4x per event.
+GLITCH_FACTOR = 1e6
 
 # Trade ExitReason -> reporter.py alert keys.
 _REASON_MAP = {
@@ -54,6 +59,7 @@ _REASON_MAP = {
     "TRAILING_STOP": "trailing",
     "TTL": "ttl",
     "MANUAL": "dead",
+    "PRICE_UNAVAILABLE": "stale",
 }
 
 
@@ -92,6 +98,15 @@ class PaperTrader:
         self.last_price: dict[str, float] = {}
         self.last_time: dict[str, int] = {}
         self.last_seen: dict[str, int] = {}
+        # Last price/event-timestamp a mint reached without being a glitch;
+        # used to freeze price on feed glitches and to force-close positions
+        # whose price feed has gone stale.
+        self.valid_price: dict[str, float] = {}
+        self.last_valid_ts: dict[str, int] = {}
+        self.price_glitches = 0
+        self.stale_close_seconds = max(
+            300, 5 * int(getattr(sim_config, "ttl_seconds", 60))
+        )
         self.trade_events = 0
         self.events_seen = 0
         self.bytes_seen = 0
@@ -172,6 +187,10 @@ class PaperTrader:
                 pf=m["profit_factor"],
                 balance=self.sim.portfolio.balance,
                 exit_counts=m["exit_reasons"],
+                avg_win=m["avg_win"],
+                avg_loss=m["avg_loss"],
+                reward_risk=m["reward_risk"],
+                expectancy=m["expectancy"],
             )
         )
 
@@ -209,16 +228,64 @@ class PaperTrader:
     # Event handling
     # ---------------------------------------------------------------
 
+    def _sanitize(self, event: ReplayEvent) -> bool:
+        """Return False to drop the event; otherwise guarantee ``event.price``
+        holds the mint's last plausible price.
+
+        A price glitch is any event whose price is non-positive or jumps by
+        more than ``GLITCH_FACTOR`` from the mint's last valid price. On a
+        glitch the last valid price is frozen into the event *before* the
+        ``FeatureEngine`` sees it, so the mint's price history, high/low and
+        derived features are never polluted by the bad tick.
+        """
+        mint = event.mint
+        price = event.price
+        valid = self.valid_price.get(mint)
+        glitch = (
+            price <= 0
+            or (valid is not None and price < valid / GLITCH_FACTOR)
+            or (valid is not None and price > valid * GLITCH_FACTOR)
+        )
+        if not glitch:
+            self.valid_price[mint] = price
+            return True
+        self.price_glitches += 1
+        if valid is None:
+            return False
+        event.price = valid
+        return True
+
+    def _close_stale(self) -> None:
+        """Force-close any position whose price feed went quiet past the
+        staleness window, at the last valid price (``PRICE_UNAVAILABLE``)."""
+        now_ts = int(time.time())
+        for mint in list(self.sim.portfolio.positions):
+            last = self.last_valid_ts.get(mint)
+            if last is not None and now_ts - last < self.stale_close_seconds:
+                continue
+            position = self.sim.portfolio.positions[mint]
+            price = self.valid_price.get(mint, position.entry_price)
+            closed_before = len(self.sim.portfolio.closed)
+            self.sim.portfolio.close_position(
+                mint, price, now_ts, ExitReason.PRICE_UNAVAILABLE
+            )
+            for trade in self.sim.portfolio.closed[closed_before:]:
+                self._on_trade_closed(trade)
+
     def _on_raw(self, raw: dict) -> None:
         self.events_seen += 1
         event = EventParser.parse(raw)
         if event is None:
             return
         self.trade_events += 1
+        if not self._sanitize(event):
+            return
         snapshot = self.engine.update(event)
-        self.last_price[snapshot.mint] = snapshot.features["price"]
+        price = snapshot.features["price"]
+        self.last_price[snapshot.mint] = price
         self.last_time[snapshot.mint] = snapshot.timestamp
         self.last_seen[snapshot.mint] = snapshot.timestamp
+        self.last_valid_ts[snapshot.mint] = snapshot.timestamp
         was_open = self.sim.portfolio.has_position(snapshot.mint)
         closed_before = len(self.sim.portfolio.closed)
         self.sim.step(snapshot)
@@ -227,6 +294,7 @@ class PaperTrader:
                 self._on_trade_closed(trade)
         if not was_open and self.sim.portfolio.has_position(snapshot.mint):
             self._on_entry(snapshot)
+        self._close_stale()
 
     def _log_closed(self) -> None:
         closed = self.sim.portfolio.closed
@@ -267,6 +335,8 @@ class PaperTrader:
             self.last_seen.pop(m, None)
             self.last_price.pop(m, None)
             self.last_time.pop(m, None)
+            self.valid_price.pop(m, None)
+            self.last_valid_ts.pop(m, None)
 
     # ---------------------------------------------------------------
     # Reporting
@@ -295,6 +365,13 @@ class PaperTrader:
             sum(t.exit_time - t.entry_time for t in trades) / len(trades)
             if trades else 0
         )
+        win_rate = (len(wins) / len(trades)) if trades else 0.0
+        avg_win = (sum(t.pnl for t in wins) / len(wins)) if wins else 0.0
+        avg_loss = (sum(abs(t.pnl) for t in losses) / len(losses)) if losses else 0.0
+        reward_risk = avg_win / avg_loss if avg_loss > 0 else (
+            999.0 if avg_win > 0 else 0.0
+        )
+        expectancy = (win_rate * avg_win) - ((1.0 - win_rate) * avg_loss)
         reasons: dict[str, int] = {}
         for t in trades:
             reasons[t.reason.value] = reasons.get(t.reason.value, 0) + 1
@@ -310,6 +387,7 @@ class PaperTrader:
                 "events_seen": self.events_seen,
                 "trade_events": self.trade_events,
                 "bytes_seen": self.bytes_seen,
+                "price_glitches": self.price_glitches,
                 "connected": self.connected_at is not None,
             },
             "portfolio": {
@@ -324,13 +402,17 @@ class PaperTrader:
                 "trades": len(trades),
                 "wins": len(wins),
                 "losses": len(losses),
-                "win_rate": round(len(wins) / len(trades), 4) if trades else 0.0,
+                "win_rate": round(win_rate, 4),
                 "gross_profit": round(gross_profit, 6),
                 "gross_loss": round(gross_loss, 6),
                 "profit_factor": round(profit_factor, 4),
                 "total_pnl": round(sum(t.pnl for t in trades), 6),
                 "avg_roi": round(avg_roi, 6),
                 "avg_hold_seconds": avg_hold,
+                "avg_win": round(avg_win, 6),
+                "avg_loss": round(avg_loss, 6),
+                "reward_risk": round(reward_risk, 4),
+                "expectancy": round(expectancy, 6),
                 "max_drawdown": round(p.stats.max_drawdown, 6),
                 "exit_reasons": reasons,
             },
@@ -369,6 +451,7 @@ class PaperTrader:
             try:
                 message = await asyncio.wait_for(ws.recv(), timeout=5)
             except asyncio.TimeoutError:
+                self._close_stale()
                 continue
             except websockets.ConnectionClosed:
                 print("[paper] stream closed", flush=True)

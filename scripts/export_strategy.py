@@ -72,10 +72,7 @@ def train_scaler(
         )
         exprs.append(clean.mean().alias(f"{c}__mean"))
         exprs.append(clean.std(ddof=0).alias(f"{c}__std"))
-    try:
-        row = train.select(exprs).collect(engine="streaming").row(0)
-    except TypeError:
-        row = train.select(exprs).collect(streaming=True).row(0)
+    row = train.select(exprs).collect(engine="streaming").row(0)
 
     return {
         c: [float(row[2 * i]), float(row[2 * i + 1])]

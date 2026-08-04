@@ -66,6 +66,7 @@ EMOJI = {
     "trailing": "\U0001f4c8",
     "ttl": "\u23f3",
     "dead": "\U0001f480",
+    "stale": "\u2757",
 }
 
 B = "\U0001f539"
@@ -207,26 +208,37 @@ class TelegramNotifier:
         pf: float,
         balance: float,
         exit_counts: dict[str, int],
+        avg_win: float | None = None,
+        avg_loss: float | None = None,
+        reward_risk: float | None = None,
+        expectancy: float | None = None,
     ):
         runtime_m = runtime_s / 60
         s = _sign(pnl)
         pfs = _pf_str(pf)
-        exit_lines = (
-            "\n".join(
-                f"  {EMOJI.get(k, B)} `{k}: {v}`"
-                for k, v in sorted(exit_counts.items())
-            )
-            if exit_counts
-            else f"  {B} `no exits yet`"
-        )
-        text = (
+        lines = [
             f"{EMOJI['summary']} **Paper Trader Summary**\n"
             f"{B} Runtime `{runtime_m:.0f}m`\n"
             f"{B} Trades `{trades}` {R} Win Rate `{win_rate:.1f}%`\n"
             f"{B} PnL `{s}{pnl:.4f} SOL` {R} PF `{pfs}`\n"
-            f"{B} Balance `{balance:.4f} SOL`\n"
-            f"{exit_lines}"
+            f"{B} Balance `{balance:.4f} SOL`",
+        ]
+        if expectancy is not None:
+            lines.append(
+                f"{B} Avg W/L `{avg_win:.4f}/{avg_loss:.4f}` "
+                f"R:R `{reward_risk:.2f}` Exp `{_sign(expectancy)}{abs(expectancy):.5f}`"
+            )
+        lines.append(
+            (
+                "\n".join(
+                    f"  {EMOJI.get(k, B)} `{k}: {v}`"
+                    for k, v in sorted(exit_counts.items())
+                )
+                if exit_counts
+                else f"  {B} `no exits yet`"
+            )
         )
+        text = "\n".join(lines)
         await self._send(text)
 
     async def send_stopped(
